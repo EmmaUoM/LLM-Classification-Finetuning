@@ -19,7 +19,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--input-root",
         type=Path,
-        default=Path("/kaggle/input"),
+        default=Path("/input"),
     )
 
     parser.add_argument(
