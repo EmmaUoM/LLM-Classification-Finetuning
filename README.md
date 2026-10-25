@@ -1,209 +1,152 @@
-# LLM Human Preference Prediction
+# LLM Classification Ensemble with MLflow
 
-An inference pipeline that predicts which of two language-model responses a human would prefer: **Response A**, **Response B**, or a **tie**. It combines Gemma 2 and Llama 3 sequence classifiers with a custom DeBERTa classifier that incorporates semantic similarity features, then exports a probability-based `submission.csv`.
+A modular version of `finetuning_test2_mlops.py`. It runs inference with existing
+Gemma2, Llama3, and custom DeBERTa checkpoints and combines their predictions.
+All comments and docstrings are in English. This project does not train models.
 
-The supplied script loads existing model checkpoints. It does not implement model fine-tuning, training, or performance evaluation.
+## Files
 
-## Pipeline
+Keep all of these files together in the same directory.
 
-1. **Prepare inputs:** Read the test CSV, validate its required columns, and create original and A/B-swapped Parquet files. Add placeholder label columns required by the dataset loader.
-2. **Run Gemma 2:** Predict class probabilities using the original response order.
-3. **Run Llama 3:** Predict class probabilities using the swapped response order.
-4. **Extract semantic features:** Encode prompts and responses with SentenceTransformer, normalise the embeddings, and search a FAISS inner-product index to obtain two similarity features per row.
-5. **Run the custom classifier:** Combine tokenised prompt/response text with the similarity features using the saved DeBERTa model.
-6. **Ensemble predictions:** Restore Llama's original A/B class order and combine all three probability arrays with fixed weights.
-
-| Model | Input order | Ensemble weight |
-| --- | --- | --- |
-| Gemma 2 | Original A/B | 0.50 |
-| Llama 3 | Swapped B/A, then class order restored | 0.25 |
-| Custom DeBERTa + similarity features | Original A/B | 0.25 |
-
-The final probability for each class is `0.50 × Gemma + 0.25 × Llama + 0.25 × Custom`.
-
-## Requirements
-
-### Hardware
-
-- **Two NVIDIA CUDA GPUs**, visible as `cuda:0` and `cuda:1`.
-- Sufficient GPU memory for the supplied checkpoints and configured token budgets.
-- Disk space for model assets, intermediate files, and outputs.
-
-The script explicitly requires at least two CUDA GPUs. Its LLM layers are split across the first two GPUs, and the custom classifier runs on `cuda:0`. There is no CPU, single-GPU, or Apple MPS execution path in the supplied code. Minimum GPU memory is not specified.
-
-### Software
-
-The script records the following original notebook environment:
-
-| Dependency | Version or requirement |
+| File | Responsibility |
 | --- | --- |
-| Python | 3.10 |
-| PyTorch | 2.1.2, with CUDA support |
-| Transformers | 4.42.3 |
-| Triton | 2.2.0 |
-| xFormers | Original notebook's custom wheel |
-| SentenceTransformers | 3.3.1 |
-| FAISS | `faiss-cpu==1.7.2` |
-| NumPy | 1.26.4 |
-| Other Python packages | `pandas`, `pyarrow`, `tqdm`, `accelerate` |
-| Custom model code | Original `lmsys-modules-0805` assets |
+| `main.py` | Command-line entry point, run directories, logs, and failure handling |
+| `config.py` | Arguments, shared class order, and logger |
+| `data.py` | CSV validation, A/B-swapped inputs, real labels, and FAISS features |
+| `models.py` | Custom DeBERTa architecture and legacy checkpoint loading |
+| `inference.py` | Gemma2, Llama3, and custom classifier inference |
+| `evaluation.py` | Probability checks, weighted ensemble, and evaluation metrics |
+| `tracking.py` | MLflow parameters, metrics, artifacts, and runtime/GPU monitoring |
+| `utils.py` | Seeds, hashes, source snapshots, environment snapshots, and JSON |
+| `pipeline.py` | Execution of all pipeline stages |
+| `requirements-mlops.txt` | Additional MLflow dependencies |
 
-These versions are recorded from the source comments, not a verified dependency lockfile. Reuse the original notebook's compatible CUDA/PyTorch/Triton/xFormers setup. A generic xFormers installation is not established as a replacement for its custom wheel.
+## Environment
 
-## Required assets
+Use the GPU environment and model files from the original notebook. The pipeline
+requires two NVIDIA CUDA GPUs; the large LLMs are split across `cuda:0` and `cuda:1`.
+The original runtime used Python 3.10, torch 2.1.2, transformers 4.42.3,
+triton 2.2.0, a custom xformers wheel, sentence-transformers 3.3.1,
+faiss-cpu 1.7.2, numpy 1.26.4, pandas, pyarrow, tqdm, and accelerate.
+`requirements-mlops.txt` adds tracking dependencies to that environment; it does
+not reconstruct the original custom GPU environment or download model weights.
 
-All paths below are relative to `--input-root`, which defaults to `/kaggle/input`.
-
-| Path | Required contents |
-| --- | --- |
-| `llm-classification-finetuning/test.csv` | Test data |
-| `lmsys-modules-0805/` | Original custom package contents, including `data/`, `models/`, and utilities |
-| `lmsys-checkpoints-0-0805/` | Gemma 2 checkpoint, configuration, and tokenizer |
-| `lmsys-checkpoints-3-0805/` | Llama 3 checkpoint, configuration, and tokenizer |
-| `some-pack/sentence-transformer-model/` | SentenceTransformer model assets |
-| `akemiiiiii/custom_model_dir/` | Custom classifier checkpoint and tokenizer assets |
-| `akemiiiiii/custom_model_dir/custom_model_complete.pth` | Complete saved PyTorch model object |
-
-The model files, custom wheel, and auxiliary modules must be obtained separately from the original notebook inputs. The script does not download them.
-
-At runtime, `lmsys-modules-0805/` is copied into `<output-dir>/human_pref/` and the output directory is added to Python's module search path. The source directory must therefore contain the package contents directly. The LLM implementations must provide the custom `forward_part1` and `forward_part2` methods used by the script.
-
-## Setup
-
-The examples assume the supplied Python code has been saved as `finetuning_test2.py`.
-
-1. Create a Python 3.10 environment, or use the original notebook environment:
-
-   ```bash
-   python3.10 -m venv .venv
-   source .venv/bin/activate
-   ```
-
-2. Restore the original compatible CUDA-enabled PyTorch, Triton, and custom xFormers stack. Their exact installation commands and wheel are not included in the supplied code.
-
-3. Install the remaining declared Python packages in that environment:
-
-   ```bash
-   python -m pip install \
-     "transformers==4.42.3" \
-     "sentence-transformers==3.3.1" \
-     "faiss-cpu==1.7.2" \
-     "numpy==1.26.4" \
-     pandas pyarrow tqdm accelerate
-   ```
-
-   This command does not install the custom modules, checkpoints, or GPU stack. Preserve the original environment's package constraints when available.
-
-4. Place the required assets under the chosen input root and confirm that PyTorch can see both GPUs:
-
-   ```bash
-   python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Visible GPUs:', torch.cuda.device_count())"
-   ```
-
-## Input format
-
-`test.csv` must contain at least one row and the following columns:
-
-| Column | Description |
-| --- | --- |
-| `id` | Identifier copied into the final submission |
-| `prompt` | Prompt or conversation input |
-| `response_a` | First candidate response |
-| `response_b` | Second candidate response |
-
-Preserve the original notebook's CSV cell representation, including any serialised multi-turn strings expected by `LMSYSDataset` and `ProcessorPAB`. Their parsing logic is supplied by the external `human_pref` package. The semantic feature stage passes the cell values directly to SentenceTransformer without parsing them.
-
-Ground-truth labels are not required. The script sets `winner_model_a=1`, `winner_model_b=0`, and `winner_tie=0` as loader placeholders; these are not observed outcomes and must not be used to interpret model accuracy.
-
-## Usage
-
-Run with the default Kaggle input location:
+Install the tracking dependencies in that environment:
 
 ```bash
-python finetuning_test2.py
+python -m pip install -r requirements-mlops.txt
 ```
 
-Run with a custom asset directory and output location:
+The SQLAlchemy version constraint preserves compatibility with MLflow 2.22.2.
+
+## Inputs
+
+Under `--input-root`, the existing notebook inputs must be available at:
+
+- `llm-classification-finetuning/test.csv`
+- `lmsys-modules-0805/`
+- `lmsys-checkpoints-0-0805/`
+- `lmsys-checkpoints-3-0805/`
+- `some-pack/sentence-transformer-model/`
+- `akemiiiiii/custom_model_dir/custom_model_complete.pth`
+
+The custom model directory must also contain its tokenizer files.
+The CSV requires unique non-null `id` values and string columns `prompt`,
+`response_a`, and `response_b`. Text strings retain their original notebook
+representation. Use `--test-csv /path/to/test.csv` to select another input CSV.
+
+## Run
+
+From the directory containing `main.py`:
 
 ```bash
-python finetuning_test2.py \
-  --input-root /path/to/input \
-  --output-dir ./output \
-  --num-workers 4
+python main.py --input-root /kaggle/input
 ```
 
-| Argument | Default | Purpose |
-| --- | --- | --- |
-| `--input-root` | `/kaggle/input` | Root directory containing the required inputs |
-| `--output-dir` | `./output` | Destination for copied modules, intermediates, and predictions |
-| `--num-workers` | `4` | DataLoader worker count for Gemma and Llama inference |
+Display all available arguments:
 
-The output directory is created automatically. Each run executes the full pipeline and overwrites matching output files; there are no resume or stage-selection options.
+```bash
+python main.py --help
+```
 
-### Fixed inference settings
+MLflow is enabled by default. Each execution creates an isolated directory under
+`output/`, named with a UTC timestamp and a unique suffix. The console prints its
+exact location. The directory contains `submission.csv`, three prediction NPY
+files, original/swapped Parquet inputs, JSON metadata, and `pipeline.log`.
 
-These settings are defined in the Python code rather than exposed as command-line arguments:
+Default ensemble weights are Gemma2 = 0.5, Llama3 = 0.25, and custom DeBERTa = 0.25.
+Llama receives swapped responses, and its class order is restored before ensembling.
+Override weights with `--ensemble-weights GEMMA LLAMA CUSTOM`.
+As in the original script, each response's semantic feature is its maximum
+similarity to any prompt in the input batch, rather than just its paired prompt.
 
-| Setting | Value |
-| --- | --- |
-| LLM input length limit | 4,096 tokens |
-| LLM DataLoader batch size | 80, subdivided by the collator |
-| Collator token budget | 8,192 |
-| LLM precision | Float16 model weights with CUDA autocast |
-| Custom classifier batch size | 8 |
-| Custom classifier input length | 512 tokens, with truncation and fixed-length padding |
+## MLflow
 
-## Outputs
+The default tracking backend is `mlflow.db` in the current working directory.
+Source/configuration artifacts and run metadata are stored locally in `mlartifacts/`.
+Open the UI from the same directory:
 
-| File or directory | Contents |
-| --- | --- |
-| `human_pref/` | Copied custom inference modules |
-| `test.parquet` | Original test rows with placeholder labels |
-| `test_swap.parquet` | Test rows with responses A and B exchanged |
-| `prob_m0.npy` | Gemma probabilities in original response order, shape `(N, 3)` |
-| `prob_m3.npy` | Llama probabilities for swapped responses, shape `(N, 3)` |
-| `prob_faiss.npy` | Custom classifier probabilities, shape `(N, 3)` |
-| `submission.csv` | Final weighted probabilities and original row IDs |
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
+```
 
-`N` is the number of test rows. Before ensembling, `make_submission()` reorders Llama's probability columns with `[:, [1, 0, 2]]`; its saved `.npy` file retains the swapped class order.
+Open `http://localhost:5000` in a browser. Use `--tracking-uri` or
+`MLFLOW_TRACKING_URI` to select another backend or tracking server. Its configured
+artifact storage then applies. Prediction files are copied to MLflow only when
+`--log-predictions` is supplied. Raw input text, labels, and model weights are not
+uploaded. Every run tracks all project source files and a combined source hash,
+input fingerprints, installed package versions, configuration, stage durations,
+and peak GPU memory where available. Failed runs retain local diagnostics and
+are marked failed in MLflow when a tracking run has been started.
 
-The final CSV has these columns, in order:
+Disable MLflow while retaining local metrics and outputs:
 
-```text
+```bash
+python main.py --input-root /kaggle/input --disable-mlflow
+```
+
+## Optional evaluation
+
+Provide a separate labels CSV containing exactly the input IDs, in any row order:
+
+```csv
 id,winner_model_a,winner_model_b,winner_tie
+101,1,0,0
+102,0,1,0
+103,0,0,1
 ```
 
-The prediction columns contain probabilities, not hard class labels. The ensemble checks that each input probability array has shape `(N, 3)` and contains only finite values. It prints the first submission rows and the saved file path.
+Each row must have exactly one winner. The example IDs must be replaced with
+your own input IDs. Evaluate on held-out examples:
 
-## Semantic features and custom model
+```bash
+python main.py --input-root /kaggle/input \
+    --test-csv validation.csv --labels-csv validation_labels.csv \
+    --run-name validation-ensemble
+```
 
-SentenceTransformer encodes all prompts and both response columns. Each embedding is L2-normalised, and FAISS `IndexFlatIP` searches for the most similar prompt embedding for each response. For nonzero normalised vectors, the inner-product score corresponds to cosine similarity.
+Accuracy and multiclass log loss are computed for each model and the ensemble.
+Without `--labels-csv`, only confidence, entropy, and predicted class fractions
+are recorded. The placeholder labels required by the original data loader are
+never used to calculate evaluation metrics.
 
-**Each response is compared with every prompt in the current test set**, not only its own row's prompt. `similarity_a` and `similarity_b` are the maximum scores for responses A and B respectively. Consequently, these features can change when other test rows are added or removed. This preserves the supplied implementation.
+## Reproducibility and checkpoints
 
-The declared `CustomDebertaModel` projects the two similarity features into the base encoder's hidden dimension. It uses the first-token text embedding as a query to a four-head attention layer over the projected feature vector, concatenates the text and attention outputs, and predicts three classes through a classifier. Inference loads the complete saved model object rather than constructing a new model from this class.
+Set `--seed` to control the Python, NumPy, and torch seeds. Optional
+`--deterministic` enables deterministic torch settings with warnings for
+unsupported operations; custom GPU kernels may remain nondeterministic.
+Input CSVs and project source files receive full SHA-256 fingerprints. Large
+checkpoint files use size/mtime metadata by default. Add `--hash-checkpoints`
+to hash every input byte, which can take longer for large models.
 
-## Troubleshooting
+The custom checkpoint stores a full Python model object. `models.py` retains
+the architecture and resolves `CustomDebertaModel` saved under the original
+notebook or single-script module names. Load checkpoints from trusted sources.
 
-| Symptom | What to check |
-| --- | --- |
-| `Missing notebook inputs` | Confirm the input root and exact asset paths listed above. |
-| Two-GPU requirement error | Confirm that two NVIDIA GPUs are allocated and visible to PyTorch. |
-| `human_pref` import or custom model method error | Restore the original module files and their expected directory layout. |
-| xFormers, Triton, or CUDA errors | Recreate the original compatible compiled dependency stack and custom wheel. |
-| Custom checkpoint cannot be loaded | Use the original complete model checkpoint, matching class definitions, and compatible dependencies. A state dictionary alone is not accepted by this loader. |
-| CUDA out of memory | Reduce the token budget or batch sizes in `predict_llm()` and `predict_custom_model()`, and check for other GPU workloads. |
-| Missing columns or empty CSV | Supply a nonempty test file with all four required columns. |
-| Unexpected probability shape or non-finite values | Check checkpoint class counts, inference outputs, and numerical stability. |
+## Verification
 
-## Scope and reproducibility
-
-- The custom checkpoint is loaded with `torch.load(..., weights_only=False)`. Use a trusted checkpoint because complete-object loading can execute Python code.
-- The script provides no training loop, validation split, evaluation metrics, or checkpoint download utilities. No prediction-quality claims can be established from this code alone.
-- Ensemble weights, model paths, and inference settings are fixed in the source. Changing them requires editing the script.
-- Semantic feature columns are used in memory and are not exported as a separate feature file.
-- Full reproduction depends on the original checkpoints, custom modules, wheel, and compatible runtime. End-to-end execution was not verified when preparing this README.
-
-## License
-
-The supplied Python source declares `SPDX-License-Identifier: Apache-2.0`. Check the applicable licenses and access terms for the external model checkpoints, datasets, and auxiliary code before redistribution or reuse.
+The module split was checked for Python 3.10 syntax, imports, CSV/Parquet input
+preparation, probability checks, label alignment, A/B restoration, source hashes,
+and real MLflow SQLite success/failure logging using synthetic model predictions.
+The compatibility unpickler was checked with a synthetic legacy model object.
+Actual GPU inference requires the original model artifacts and was not run here.
