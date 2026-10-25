@@ -60,7 +60,7 @@ representation. Use `--test-csv /path/to/test.csv` to select another input CSV.
 From the directory containing `main.py`:
 
 ```bash
-python main.py --input-root /kaggle/input
+python main.py --input-root /input
 ```
 
 Display all available arguments:
@@ -102,7 +102,7 @@ are marked failed in MLflow when a tracking run has been started.
 Disable MLflow while retaining local metrics and outputs:
 
 ```bash
-python main.py --input-root /kaggle/input --disable-mlflow
+python main.py --input-root /input --disable-mlflow
 ```
 
 ## Optional evaluation
