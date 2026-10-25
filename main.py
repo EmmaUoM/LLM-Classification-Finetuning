@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Command-line entry point. Run: python main.py --input-root /kaggle/input"""
 
 import logging
 import os
