@@ -1,0 +1,4 @@
+# Additional tracking dependencies for the existing GPU inference environment.
+# The original model libraries and custom xformers wheel must already be installed.
+mlflow==2.22.2
+sqlalchemy<2.1
