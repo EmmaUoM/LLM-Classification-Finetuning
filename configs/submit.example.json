@@ -1,0 +1,11 @@
+{
+  "mode": "submit",
+  "test_csv": "/kaggle/input/llm-classification-finetuning/test.csv",
+  "output_root": "/kaggle/working",
+  "inference_bundles": {
+    "deberta": "/kaggle/input/YOUR_TRAINED_MODELS/runs/RUN_ID/models/deberta"
+  },
+  "local_files_only": true,
+  "enable_mlflow": true,
+  "tta": true
+}

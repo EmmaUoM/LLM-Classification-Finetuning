@@ -1,133 +1,215 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Orchestrate data preparation, inference, evaluation, and provenance."""
-
+"""Orchestrate data QA, fine-tuning, validation, and offline competition inference."""
+from __future__ import annotations
 import json
+import os
 import shutil
-import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 
-from config import CLASS_COLUMNS
-from data import compute_semantic_features, load_labels, prepare_test_files
-from evaluation import make_submission, prediction_metrics
-from inference import clear_gpu_memory, predict_custom_model, predict_llm
-from tracking import track_stage
-from utils import environment_snapshot, file_manifest, seed_everything
-from utils import sha256_file, source_manifest, write_json
+from config import CLASS_COLUMNS, TEXT_COLUMNS, LOGGER
+from data import clean_dataframe, load_labels, load_sentence_encoder, semantic_features, split_training_data
+from evaluation import classification_metrics, make_submission, weighted_ensemble
+from inference import predict_probabilities
+from models import load_model_bundle
+from tracking import RunTracker, track_stage
+from training import train_backend
+from utils import bundle_manifest, create_run_directory, release_gpu, set_seeds, sha256_file, verify_bundle, write_json
 
 
-def run_pipeline(args, output_dir, tracker):
-    input_root = args.input_root
-    test_csv = args.test_csv or input_root / "llm-classification-finetuning" / "test.csv"
-    required = [
-        test_csv,
-        input_root / "lmsys-modules-0805",
-        input_root / "lmsys-checkpoints-0-0805",
-        input_root / "lmsys-checkpoints-3-0805",
-        input_root / "some-pack" / "sentence-transformer-model",
-        (
-            input_root
-            / "akemiiiiii"
-            / "custom_model_dir"
-            / "custom_model_complete.pth"
-        ),
-    ]
-    if args.labels_csv:
-        required.append(args.labels_csv)
+def text_profile(frame):
+    return {column: {"mean_characters": float(frame[column].str.len().mean()),
+                     "p95_characters": float(frame[column].str.len().quantile(0.95)),
+                     "empty_fraction": float(frame[column].eq("").mean())}
+            for column in TEXT_COLUMNS}
 
-    with track_stage("preflight", tracker):
-        missing = [str(path) for path in required if not path.exists()]
-        if missing:
-            raise FileNotFoundError("Missing notebook inputs:\n" + "\n".join(missing))
-        if torch.cuda.device_count() < 2:
-            raise RuntimeError("The original LLM pipeline requires two NVIDIA CUDA GPUs.")
-        seed_everything(args.seed, args.deterministic)
-        df = prepare_test_files(test_csv, output_dir)
-        labels = load_labels(args.labels_csv, df["id"].to_numpy()) if args.labels_csv else None
 
-    with track_stage("provenance", tracker):
-        project_dir = Path(__file__).resolve().parent
-        manifest = {
-            "source": source_manifest(project_dir),
-            "inputs": [file_manifest(path, hash_all=(
-                args.hash_checkpoints or path == test_csv or path == args.labels_csv
-            )) for path in required],
-            "row_count": len(df),
-            "schema": {column: str(df[column].dtype)
-                       for column in ["id", "prompt", "response_a", "response_b"]},
-            "semantic_feature_scope": "maximum similarity to any test-set prompt",
+def train_pipeline(cfg, run_dir, tracker):
+    with track_stage("data_cleaning_and_split", tracker):
+        train_path = Path(cfg.train_csv)
+        if not train_path.is_file():
+            raise FileNotFoundError(f"Attach the competition train.csv or set cfg.train_csv: {train_path}")
+        raw = pd.read_csv(train_path, dtype={"id": str})
+        cleaned, quality, rejected = clean_dataframe(raw, training=True)
+        train, valid = split_training_data(cleaned, cfg)
+        quality["split"] = {
+            "method": "StratifiedGroupKFold by normalized full question",
+            "n_splits": cfg.n_splits, "holdout_fold": cfg.holdout_fold,
+            "train_rows_used": len(train), "validation_rows_used": len(valid),
+            "prompt_group_overlap": 0, "response_pair_overlap": 0,
+            "train_class_counts": train.label.value_counts().sort_index().to_dict(),
+            "validation_class_counts": valid.label.value_counts().sort_index().to_dict(),
+            "max_train_rows": cfg.max_train_rows, "max_val_rows": cfg.max_val_rows,
         }
-        write_json(output_dir / "input_manifest.json", manifest)
-        write_json(output_dir / "environment.json", environment_snapshot())
-        for item in manifest["source"]["files"]:
-            tracker.log_artifact(project_dir / item["file"], "source")
-        for name in ["run_config.json", "input_manifest.json", "environment.json"]:
-            tracker.log_artifact(output_dir / name)
-        tracker.log_params({
-            "seed": args.seed,
-            "deterministic": args.deterministic,
-            "num_workers": args.num_workers,
-            "llm_max_length": args.llm_max_length,
-            "llm_batch_size": args.llm_batch_size,
-            "llm_max_tokens": args.llm_max_tokens,
-            "custom_max_length": args.custom_max_length,
-            "custom_batch_size": args.custom_batch_size,
-            "ensemble_weights": json.dumps(args.ensemble_weights),
-            "data_sha256": manifest["inputs"][0]["files"][0]["sha256"],
-            "source_sha256": manifest["source"]["sha256"],
-            "hash_checkpoints": args.hash_checkpoints,
-            "labels_provided": labels is not None,
+        write_json(run_dir / "data_quality_report.json", quality)
+        rejected.to_csv(run_dir / "rejected_training_rows.csv", index=False)
+        keys = ["id", "label", "_prompt_group", "_pair_key", "_source_row"]
+        train[keys].to_csv(run_dir / "train_split.csv", index=False)
+        valid[keys].to_csv(run_dir / "validation_split.csv", index=False)
+        provenance = {"train_csv": str(train_path), "train_sha256": sha256_file(train_path),
+                      "train_rows": len(train), "validation_rows": len(valid),
+                      "class_order": CLASS_COLUMNS,
+                      "feature_definition": "Cosine of each answer with its OWN question; no test-set index.",
+                      "source_sha256": tracker.source_info["sha256"] if tracker.source_info else None}
+        write_json(run_dir / "data_manifest.json", provenance)
+        tracker.params({"train_csv_sha256": provenance["train_sha256"],
+                        "training_rows_used": len(train), "validation_rows_used": len(valid)})
+        tracker.metrics({"input_training_rows": len(raw), "clean_training_rows": len(cleaned),
+                         "dropped_training_rows": len(raw) - len(cleaned)})
+        for filename in ("data_quality_report.json", "rejected_training_rows.csv", "train_split.csv",
+                         "validation_split.csv", "data_manifest.json"):
+            tracker.artifact(run_dir / filename)
+        LOGGER.info("Data quality and split: %s", json.dumps(quality, default=str))
+        del raw, cleaned
+
+    train_features, valid_features = None, None
+    if "deberta" in cfg.train_backends and cfg.use_semantic_features:
+        with track_stage("paired_semantic_features", tracker):
+            encoder = load_sentence_encoder(cfg.sentence_model, cfg, cfg.sentence_revision)
+            train_features = semantic_features(train, encoder, cfg.sentence_batch_size)
+            valid_features = semantic_features(valid, encoder, cfg.sentence_batch_size)
+            encoder.save_pretrained(str(run_dir / "models" / "deberta" / "semantic_encoder"))
+            np.save(run_dir / "train_similarity_features.npy", train_features)
+            np.save(run_dir / "validation_similarity_features.npy", valid_features)
+            del encoder
+            release_gpu()
+
+    validation_predictions, directories = {}, {}
+    for name in cfg.train_backends:
+        with track_stage(f"{name}_finetuning", tracker):
+            probabilities, directory = train_backend(
+                name, train, valid, train_features if name == "deberta" else None,
+                valid_features if name == "deberta" else None, cfg, run_dir, tracker)
+            validation_predictions[name], directories[name] = probabilities, directory
+            metadata_path = directory / "bundle_config.json"
+            metadata = json.loads(metadata_path.read_text())
+            metadata["train_csv_sha256"] = provenance["train_sha256"]
+            metadata["training_text_profile"] = text_profile(train)
+            metadata["validation_tta"] = cfg.tta
+            write_json(metadata_path, metadata)
+            bundle_manifest(directory)
+            tracker.artifact(directory / "manifest.json", f"models/{name}")
+            tracker.artifact(directory / "validation_metrics.json", f"models/{name}")
+            tracker.artifact(directory / "training_update_audit.json", f"models/{name}")
+            if cfg.log_models_to_mlflow:
+                tracker.artifacts(directory, f"model_bundles/{name}")
+
+    with track_stage("validation_ensemble", tracker):
+        ensemble, weights = weighted_ensemble(validation_predictions, cfg.ensemble_weights)
+        metrics = classification_metrics(valid.label.to_numpy(), ensemble)
+        tracker.metrics({f"ensemble_validation_{key}": value for key, value in metrics.items()})
+        write_json(run_dir / "ensemble_validation.json", {
+            "metrics": metrics, "normalized_weights": weights,
+            "scope": "Development validation; weights fixed in config, not tuned on Kaggle test labels.",
         })
-        tracker.log_metrics({"input_rows": len(df)})
+        out = pd.DataFrame(ensemble, columns=CLASS_COLUMNS)
+        out.insert(0, "id", valid.id.to_numpy())
+        out["true_label"] = valid.label.to_numpy()
+        out.to_csv(run_dir / "ensemble_validation_predictions.csv", index=False)
+        tracker.artifact(run_dir / "ensemble_validation.json")
+        write_json(run_dir / "inference_config_example.json", {
+            "mode": "submit", "inference_bundles": {key: str(value) for key, value in directories.items()},
+            "ensemble_weights": weights,
+            "note": "For a separate Kaggle inference notebook, attach exported model folders as Inputs and update these paths.",
+        })
+        tracker.artifact(run_dir / "inference_config_example.json")
+    LOGGER.info("Training finished. Model bundles:")
+    for name, directory in directories.items():
+        LOGGER.info("%s: %s", name, directory)
+    LOGGER.info("Use mode='submit' with the saved model bundles to create submission.csv")
+    return {"model_bundles": {name: str(path) for name, path in directories.items()},
+            "validation_metrics": metrics, "normalized_weights": weights}
 
-    # Replace the notebook's !cp command; the run directory prevents stale files.
-    shutil.copytree(input_root / "lmsys-modules-0805", output_dir / "human_pref")
-    sys.path.insert(0, str(output_dir))
 
-    for model_kind in ["gemma", "llama"]:
-        with track_stage(f"{model_kind}_inference", tracker):
-            predict_llm(input_root, output_dir, model_kind, args.num_workers,
-                        max_length=args.llm_max_length, batch_size=args.llm_batch_size,
-                        max_tokens=args.llm_max_tokens)
-        clear_gpu_memory()
+def submission_pipeline(cfg, run_dir, tracker):
+    # train.csv is intentionally never read in this mode.
+    with track_stage("test_validation_and_cleaning", tracker):
+        test_path = Path(cfg.test_csv)
+        if not test_path.is_file():
+            raise FileNotFoundError(f"Missing test.csv: {test_path}")
+        test, quality, _ = clean_dataframe(pd.read_csv(test_path, dtype={"id": str}), training=False)
+        labels = load_labels(cfg.labels_csv, test.id.to_numpy()) if cfg.labels_csv else None
+        write_json(run_dir / "test_quality_report.json", quality)
+        write_json(run_dir / "test_manifest.json", {"test_sha256": sha256_file(test_path),
+                   "rows": len(test), "source_sha256": tracker.source_info["sha256"] if tracker.source_info else None,
+                   "labels_sha256": sha256_file(cfg.labels_csv) if cfg.labels_csv else None})
+        test[["id"]].to_csv(run_dir / "prediction_row_order.csv", index=False)
+        for filename in ("test_quality_report.json", "test_manifest.json", "prediction_row_order.csv"):
+            tracker.artifact(run_dir / filename)
+    predictions, drift_reports = {}, {}
+    for name, bundle in cfg.inference_bundles.items():
+        with track_stage(f"{name}_inference", tracker):
+            verify_bundle(bundle)
+            metadata = json.loads((Path(bundle) / "bundle_config.json").read_text())
+            if metadata["backend"] != name:
+                raise ValueError(f"Wrong backend name for bundle {bundle}")
+            features = None
+            if name == "deberta" and metadata["semantic_feature_mode"] == "paired_cosine":
+                # The sentence encoder travels with the trained custom classifier.
+                encoder = load_sentence_encoder(Path(bundle) / "semantic_encoder", cfg)
+                encoder.max_seq_length = metadata["sentence_max_length"]
+                features = semantic_features(test, encoder, cfg.sentence_batch_size)
+                del encoder
+                release_gpu()
+            model, tokenizer, metadata = load_model_bundle(bundle, cfg, name=name, verify=False)
+            values = predict_probabilities(model, tokenizer, test, features, name,
+                                           metadata["max_length"], cfg)
+            predictions[name] = values
+            if labels is not None:
+                tracker.metrics({f"{name}_evaluation_{key}": value for key, value in classification_metrics(labels, values).items()})
+            np.save(run_dir / f"prob_{name}.npy", values)
+            tracker.metrics({f"{name}_mean_confidence": values.max(axis=1).mean(),
+                             f"{name}_mean_entropy": -(values * np.log(np.clip(values, 1e-15, 1))).sum(axis=1).mean(),
+                             **{f"{name}_predicted_fraction_{key}": float(np.mean(values.argmax(axis=1) == i))
+                                for i, key in enumerate(CLASS_COLUMNS)}})
+            drift_reports[name] = {"training_text_profile": metadata.get("training_text_profile"),
+                                   "test_text_profile": text_profile(test),
+                                   "note": "Descriptive input monitoring; no test labels or accuracy are inferred."}
+            del model, tokenizer, features
+            release_gpu()
+    with track_stage("submission_export", tracker):
+        ensemble, weights = weighted_ensemble(predictions, cfg.ensemble_weights)
+        if labels is not None:
+            tracker.metrics({f"ensemble_evaluation_{key}": value for key, value in classification_metrics(labels, ensemble).items()})
+        temporary = run_dir / "submission.csv"
+        submission = make_submission(test, ensemble, temporary)
+        destination = Path(cfg.output_root) / "submission.csv"
+        # Publish only a complete, schema-checked result to the competition output location.
+        staged = destination.with_name(f".submission_{run_dir.name}.tmp")
+        shutil.copyfile(temporary, staged)
+        os.replace(staged, destination)
+        write_json(run_dir / "input_monitoring.json", drift_reports)
+        write_json(run_dir / "output_manifest.json", {
+            "submission_path": str(destination), "rows": len(submission), "class_order": CLASS_COLUMNS,
+            "submission_sha256": sha256_file(destination), "normalized_weights": weights,
+            "evaluation": "explicit_labels" if labels is not None else "No test labels: accuracy/log loss are not calculated.",
+        })
+        for filename in ("output_manifest.json", "input_monitoring.json", "submission.csv"):
+            tracker.artifact(run_dir / filename)
+    LOGGER.info("Submission ready: %s", destination)
+    LOGGER.info("Submission preview:\n%s", submission.head().to_string(index=False))
+    return {"submission": str(destination), "rows": len(test)}
 
-    with track_stage("semantic_features", tracker):
-        df = compute_semantic_features(df, input_root)
-        features = df[["similarity_a", "similarity_b"]].to_numpy(dtype=float)
-        if not np.isfinite(features).all():
-            raise ValueError("Semantic features contain non-finite values.")
-    clear_gpu_memory()
 
-    with track_stage("custom_inference", tracker):
-        predict_custom_model(df, input_root, output_dir,
-                             batch_size=args.custom_batch_size,
-                             max_length=args.custom_max_length)
-    clear_gpu_memory()
-
-    with track_stage("ensemble", tracker):
-        submission = make_submission(df, output_dir, args.ensemble_weights)
-        arrays = {
-            "gemma": np.load(output_dir / "prob_m0.npy", allow_pickle=False),
-            # Compare all models using the original A/B class order.
-            "llama": np.load(output_dir / "prob_m3.npy", allow_pickle=False)[:, [1, 0, 2]],
-            "custom": np.load(output_dir / "prob_faiss.npy", allow_pickle=False),
-            "ensemble": submission[CLASS_COLUMNS].to_numpy(),
-        }
-        for name, probabilities in arrays.items():
-            tracker.log_metrics(prediction_metrics(name, probabilities, labels))
-
-    output_manifest = {
-        "class_order": CLASS_COLUMNS,
-        "rows": len(df),
-        "evaluation": "real_labels" if labels is not None else "skipped_no_labels",
-        "files": [{"name": name, "sha256": sha256_file(output_dir / name)}
-                  for name in ["submission.csv", "prob_m0.npy", "prob_m3.npy", "prob_faiss.npy"]],
-    }
-    write_json(output_dir / "output_manifest.json", output_manifest)
-    tracker.log_artifact(output_dir / "output_manifest.json")
-    if args.log_predictions:
-        for item in output_manifest["files"]:
-            tracker.log_artifact(output_dir / item["name"], "predictions")
-
+def run_pipeline(cfg, run_dir=None):
+    cfg.validate()
+    run_dir = create_run_directory(cfg) if run_dir is None else Path(run_dir)
+    LOGGER.info("Run directory: %s", run_dir)
+    with RunTracker(cfg, run_dir) as tracker:
+        with track_stage("preflight", tracker):
+            set_seeds(cfg.seed)
+            if cfg.mode == "train" and not torch.cuda.is_available() and not cfg.allow_cpu_training:
+                raise RuntimeError("Enable a GPU in Kaggle, or set allow_cpu_training=True only for a tiny smoke test.")
+            if cfg.mode == "submit" and not cfg.local_files_only:
+                raise AssertionError("Submission mode must load models offline")
+        if cfg.mode == "train":
+            result = train_pipeline(cfg, run_dir, tracker)
+        else:
+            result = submission_pipeline(cfg, run_dir, tracker)
+        result.update(run_directory=str(run_dir), mlflow_run_id=tracker.run_id)
+        write_json(run_dir / "result.json", result)
+        tracker.artifact(run_dir / "result.json")
+    return result

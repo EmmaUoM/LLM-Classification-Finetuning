@@ -1,0 +1,11 @@
+{
+  "mode": "train",
+  "train_csv": "/kaggle/input/llm-classification-finetuning/train.csv",
+  "output_root": "/kaggle/working",
+  "train_backends": ["deberta"],
+  "epochs": 3,
+  "deberta_batch_size": 4,
+  "grad_accum_steps": 8,
+  "use_semantic_features": true,
+  "enable_mlflow": true
+}

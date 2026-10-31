@@ -1,0 +1,3 @@
+# Tracking additions; install requirements.txt for the full runtime.
+mlflow==2.22.2
+sqlalchemy>=2.0,<2.1

@@ -1,152 +1,268 @@
-# LLM Classification Ensemble with MLflow
+# LLM Preference Classification with Fine-tuning and MLflow
 
-A modular version of `finetuning_mlops.py`. It runs inference with existing
-Gemma2, Llama3, and custom DeBERTa checkpoints and combines their predictions.
-All comments and docstrings are in English. This project does not train models.
+Predict whether a human prefers response A, response B, or a tie for the same prompt.
+This project is the modular Python version of the updated `finetuning-emma.ipynb`.
+It includes real fine-tuning on the competition training set, data cleaning,
+group-disjoint development validation, model bundles, and separate offline inference.
+
+The default trains the custom DeBERTa branch. Gemma 2 and Llama 3 can also be
+fine-tuned sequentially using 4-bit NF4 weights, LoRA adapters, and a trainable
+classification head. General pretrained models are the default starting points.
 
 ## Files
 
-Keep all of these files together in the same directory.
+Keep the Python modules together in the repository root.
 
 | File | Responsibility |
 | --- | --- |
 | `main.py` | Command-line entry point, run directories, logs, and failure handling |
-| `config.py` | Arguments, shared class order, and logger |
-| `data.py` | CSV validation, A/B-swapped inputs, real labels, and FAISS features |
-| `models.py` | Custom DeBERTa architecture and legacy checkpoint loading |
-| `inference.py` | Gemma2, Llama3, and custom classifier inference |
+| `config.py` | Arguments, shared class order, configuration, and logger |
+| `data.py` | CSV validation and cleaning, grouped splits, A/B-swapped inputs, real labels, paired semantic features, and optional FAISS features |
+| `models.py` | Custom DeBERTa architecture, QLoRA factories, model bundles, and legacy checkpoint loading |
+| `inference.py` | Gemma 2, Llama 3, and custom classifier inference with A/B restoration |
 | `evaluation.py` | Probability checks, weighted ensemble, and evaluation metrics |
-| `tracking.py` | MLflow parameters, metrics, artifacts, and runtime/GPU monitoring |
-| `utils.py` | Seeds, hashes, source snapshots, environment snapshots, and JSON |
+| `tracking.py` | MLflow parameters, metrics, artifacts, failure records, and runtime/GPU monitoring |
+| `utils.py` | Seeds, hashes, source snapshots, environment snapshots, manifests, and JSON |
 | `pipeline.py` | Execution of all pipeline stages |
+| `training.py` | Actual gradient updates, validation, early stopping, best checkpoints, and parameter-update audits |
 | `requirements-mlops.txt` | Additional MLflow dependencies |
+| `requirements.txt` | Full default DeBERTa runtime, including MLOps dependencies |
+| `requirements-qlora.txt` | Optional Gemma/Llama QLoRA runtime |
+| `requirements-faiss.txt` | Optional FAISS retrieval-feature dependencies |
+| `requirements-dev.txt` | Test dependencies |
+| `configs/` | Training and inference JSON configuration examples |
+| `tests/` | CPU behavior, checkpoint round-trip, CLI, and MLflow integration checks |
 
 ## Environment
 
-Use the GPU environment and model files from the original notebook. The pipeline
-requires two NVIDIA CUDA GPUs; the large LLMs are split across `cuda:0` and `cuda:1`.
-The original runtime used Python 3.10, torch 2.1.2, transformers 4.42.3,
-triton 2.2.0, a custom xformers wheel, sentence-transformers 3.3.1,
-faiss-cpu 1.7.2, numpy 1.26.4, pandas, pyarrow, tqdm, and accelerate.
-`requirements-mlops.txt` adds tracking dependencies to that environment; it does
-not reconstruct the original custom GPU environment or download model weights.
-
-Install the tracking dependencies in that environment:
+Python 3.10 or newer is required. Keep the CUDA-enabled PyTorch build supplied
+by Kaggle or your GPU environment, then install:
 
 ```bash
-python -m pip install -r requirements-mlops.txt
+python -m pip install -r requirements.txt
 ```
 
-The SQLAlchemy version constraint preserves compatibility with MLflow 2.22.2.
-
-## Inputs
-
-Under `--input-root`, the existing notebook inputs must be available at:
-
-- `llm-classification-finetuning/test.csv`
-- `lmsys-modules-0805/`
-- `lmsys-checkpoints-0-0805/`
-- `lmsys-checkpoints-3-0805/`
-- `some-pack/sentence-transformer-model/`
-- `akemiiiiii/custom_model_dir/custom_model_complete.pth`
-
-The custom model directory must also contain its tokenizer files.
-The CSV requires unique non-null `id` values and string columns `prompt`,
-`response_a`, and `response_b`. Text strings retain their original notebook
-representation. Use `--test-csv /path/to/test.csv` to select another input CSV.
-
-## Run
-
-From the directory containing `main.py`:
+For optional Gemma/Llama QLoRA:
 
 ```bash
-python main.py --input-root /input
+python -m pip install -r requirements-qlora.txt
 ```
 
-Display all available arguments:
+QLoRA requires an NVIDIA CUDA GPU and compatible bitsandbytes binaries. The
+notebook's old Python-3.10-specific Triton/xformers wheels are no longer required.
+One model is loaded on `cuda:0` at a time; the old two-GPU custom inference modules
+are not used by the new training pipeline.
+
+Hugging Face models may be downloaded during training, or provided as local
+standard Hugging Face directories with `--local-files-only`. Gemma/Llama access
+may require accepting the model license and authenticating through your existing
+Hugging Face login or environment. Never put access tokens in committed files.
+
+## Train
+
+Attach the Kaggle competition data and enable GPU access. By default, all cleaned
+rows assigned to the training partition are used for three epochs:
 
 ```bash
-python main.py --help
+python main.py --mode train \
+    --input-root /kaggle/input \
+    --output-dir /kaggle/working
 ```
 
-MLflow is enabled by default. Each execution creates an isolated directory under
-`output/`, named with a UTC timestamp and a unique suffix. The console prints its
-exact location. The directory contains `submission.csv`, three prediction NPY
-files, original/swapped Parquet inputs, JSON metadata, and `pipeline.log`.
-
-Default ensemble weights are Gemma2 = 0.5, Llama3 = 0.25, and custom DeBERTa = 0.25.
-Llama receives swapped responses, and its class order is restored before ensembling.
-Override weights with `--ensemble-weights GEMMA LLAMA CUSTOM`.
-As in the original script, each response's semantic feature is its maximum
-similarity to any prompt in the input batch, rather than just its paired prompt.
-
-## MLflow
-
-The default tracking backend is `mlflow.db` in the current working directory.
-Source/configuration artifacts and run metadata are stored locally in `mlartifacts/`.
-Open the UI from the same directory:
+Or use the example configuration:
 
 ```bash
-mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
+python main.py --config configs/train.json
 ```
 
-Open `http://localhost:5000` in a browser. Use `--tracking-uri` or
-`MLFLOW_TRACKING_URI` to select another backend or tracking server. Its configured
-artifact storage then applies. Prediction files are copied to MLflow only when
-`--log-predictions` is supplied. Raw input text, labels, and model weights are not
-uploaded. Every run tracks all project source files and a combined source hash,
-input fingerprints, installed package versions, configuration, stage durations,
-and peak GPU memory where available. Failed runs retain local diagnostics and
-are marked failed in MLflow when a tracking run has been started.
-
-Disable MLflow while retaining local metrics and outputs:
+Start with a smaller end-to-end run before a complete training job:
 
 ```bash
-python main.py --input-root /input --disable-mlflow
+python main.py --mode train \
+    --input-root /kaggle/input \
+    --output-dir /kaggle/working \
+    --max-train-rows 1000 --max-val-rows 300 --epochs 1
 ```
 
-## Optional evaluation
+Use local pretrained models when Internet is unavailable:
 
-Provide a separate labels CSV containing exactly the input IDs, in any row order:
+```bash
+python main.py --mode train \
+    --input-root /kaggle/input --output-dir /kaggle/working \
+    --model-source deberta=/kaggle/input/my-deberta-base \
+    --sentence-model /kaggle/input/my-sentence-transformer \
+    --local-files-only
+```
 
-```csv
+Train all three branches after installing the optional QLoRA runtime:
+
+```bash
+python main.py --mode train --input-root /kaggle/input \
+    --output-dir /kaggle/working --train-backends deberta gemma llama
+```
+
+Change individual model directories or pin Hub revisions with repeated
+`--model-source BACKEND=VALUE` and `--model-revision BACKEND=COMMIT_HASH` arguments.
+Models initialize from public DeBERTa-v3-base, Gemma-2-9b-it, and
+Meta-Llama-3-8B-Instruct by default. Old custom inference checkpoints are not
+assumed to be standard Hugging Face bases.
+
+Use `python main.py --help` for CLI options. A JSON configuration can set any
+`Config` field; explicit CLI values override it.
+
+## Cleaning and validation
+
+Input CSVs need unique test IDs and the columns `prompt`, `response_a`, and
+`response_b`. The training CSV also needs the real one-hot target columns:
+
+```text
+winner_model_a, winner_model_b, winner_tie
+```
+
+Cleaning safely parses JSON/Python-list conversation strings without `eval`,
+normalizes Unicode and control characters, and preserves case, punctuation,
+line structure, and code indentation. Invalid training labels/rows are reported
+and removed. Duplicate pairs include A/B-reversed pairs; conflicting pair labels
+are removed together. Test rows and their ID order are preserved.
+
+The development holdout is produced by `StratifiedGroupKFold` using the complete
+normalized prompt as the group. The default is one of five folds, approximately
+20% validation. The same prompt and duplicate response pair cannot cross the split.
+Only the training partition receives random A/B augmentation; labels and features
+are swapped consistently. Model-name and fold columns are not used as features.
+
+Three text components receive separate token budgets, with unused space assigned
+to longer components. This avoids truncating away the whole second answer just
+because it appears at the end of a concatenation.
+
+The holdout selects the best epoch and supports early stopping. It is a development
+set, not an untouched final test. A competition-finetuned starting checkpoint may
+already have seen holdout examples; audit its provenance before interpreting scores.
+There is no implicit full-data retraining after model selection.
+
+## Semantic features and FAISS
+
+The custom classifier uses a DeBERTa text representation plus two cosine features:
+`cos(prompt_i, response_a_i)` and `cos(prompt_i, response_b_i)`. The frozen sentence
+encoder is saved with the custom model bundle. Direct MLP feature fusion replaces
+the old single-key attention block.
+
+Paired cosine is the default and does not require FAISS. It does not search other
+prompts in the current test batch, so a row's features are independent of unrelated
+test rows. `data.FaissPromptIndex` is an optional utility for retrieval experiments:
+fit it on training-prompt embeddings only, then transform response embeddings
+against that fixed reference index. Install `requirements-faiss.txt` to use it.
+Its retrieval features must not be silently substituted for the paired features
+expected by a trained model.
+
+## Saved models and inference
+
+Every execution gets an isolated directory under `<output-dir>/runs/`:
+
+```text
+runs/<run_id>/
+  config.json
+  pipeline.log
+  source/ and source_manifest.json
+  data_quality_report.json
+  train_split.csv and validation_split.csv
+  models/<backend>/
+    bundle_config.json and manifest.json
+    training_history.csv
+    training_update_audit.json
+    validation_metrics.json and confusion_matrix.csv
+    MODEL_CARD.md
+  ensemble_validation.json
+  result.json and run_summary.json
+```
+
+The custom bundle contains backbone configuration, fine-tuned safetensors,
+tokenizer, and its sentence encoder when enabled. Gemma/Llama bundles contain
+LoRA adapters and the trained classifier head; attach the matching base weights
+separately for offline inference. Bundles produced by the updated notebook use
+the same architecture version and can be loaded here.
+
+Training mode does not export a competition submission. In a separate inference
+run, supply a saved bundle and the current test data:
+
+```bash
+python main.py --mode submit \
+    --input-root /kaggle/input --output-dir /kaggle/working \
+    --bundle deberta=/kaggle/input/my-trained-models/runs/TRAIN_RUN_ID/models/deberta
+```
+
+Or edit the placeholder path in `configs/submit.example.json` and pass `--config`.
+For Gemma/Llama, also repeat `--base-model BACKEND=LOCAL_BASE_DIRECTORY` as needed.
+Submission mode forces offline model loading and never reads `train.csv`.
+
+Both A/B orders are evaluated by default, restored to the original class order,
+and averaged. Use `--no-tta` to disable this. Available models are combined using
+fixed weights Gemma=0.50, Llama=0.25, DeBERTa=0.25, normalized over the explicitly
+provided models. Override with `--ensemble-weights GEMMA LLAMA DEBERTA`.
+
+The final file is `<output-dir>/submission.csv`, with columns:
+
+```text
 id,winner_model_a,winner_model_b,winner_tie
-101,1,0,0
-102,0,1,0
-103,0,0,1
 ```
 
-Each row must have exactly one winner. The example IDs must be replaced with
-your own input IDs. Evaluate on held-out examples:
+For Kaggle, use `/kaggle/working` as the output directory. Save and run the inference
+notebook with Internet disabled, then submit the successful version's output.
+A plain Python project can be attached as an Input or copied into the notebook's
+working directory before invoking `python main.py ...`.
+
+## Evaluation and MLflow
+
+Training records actual train loss, validation log loss, accuracy, macro-F1,
+confusion matrices, and trainable-parameter counts. Cross-entropy, backward,
+AdamW, gradient accumulation/clipping, mixed precision, and scheduling perform
+real updates. `training_update_audit.json` compares selected parameter tensors
+before and after training. Best epoch selection uses validation log loss.
+
+Inference without labels records confidence, entropy, predicted class fractions,
+and descriptive input length statistics. It does not fabricate accuracy or loss.
+To evaluate on separately labeled held-out rows, provide `--labels-csv PATH`;
+its IDs must match the inference CSV exactly and its three winner columns must
+contain valid one-hot labels. Rows are joined by ID, not assumed to share order.
+
+MLflow is enabled by default and stores metadata in `<output-dir>/mlflow.db`,
+with artifacts in `<output-dir>/mlartifacts/`. It tracks configuration, source/data
+fingerprints, package versions, stage times, peak GPU allocation, model artifacts,
+and run status. Source snapshots include all maintained modules, tests, configuration
+examples, and dependency files. Failures retain local diagnostics and are marked
+failed when a tracking run has started.
 
 ```bash
-python main.py --input-root /input \
-    --test-csv validation.csv --labels-csv validation_labels.csv \
-    --run-name validation-ensemble
+mlflow ui --backend-store-uri sqlite:////absolute/path/to/output/mlflow.db --port 5000
 ```
 
-Accuracy and multiclass log loss are computed for each model and the ensemble.
-Without `--labels-csv`, only confidence, entropy, and predicted class fractions
-are recorded. The placeholder labels required by the original data loader are
-never used to calculate evaluation metrics.
+Open `http://127.0.0.1:5000` locally. If copying output to a different machine,
+copy the model/artifact folders as well; stored artifact URIs point to their original
+absolute locations and need relocation for browsing them in a moved MLflow UI.
+The portable model bundles can be loaded directly without the tracking database.
+Use `--disable-mlflow` to keep local reports only, or `--no-log-models` to avoid
+copying model weights into MLflow's artifact store.
 
-## Reproducibility and checkpoints
+## Legacy checkpoint compatibility
 
-Set `--seed` to control the Python, NumPy, and torch seeds. Optional
-`--deterministic` enables deterministic torch settings with warnings for
-unsupported operations; custom GPU kernels may remain nondeterministic.
-Input CSVs and project source files receive full SHA-256 fingerprints. Large
-checkpoint files use size/mtime metadata by default. Add `--hash-checkpoints`
-to hash every input byte, which can take longer for large models.
-
-The custom checkpoint stores a full Python model object. `models.py` retains
-the architecture and resolves `CustomDebertaModel` saved under the original
-notebook or single-script module names. Load checkpoints from trusted sources.
+`models.LegacyCustomDebertaModel` retains the old architecture.
+`models.load_custom_checkpoint(path, trusted=True)` resolves old notebook/module
+class locations when loading a trusted full-object checkpoint. New training and
+inference use safetensors/PEFT bundles and do not invoke that pickle loader.
+Legacy models expect their original feature definition and are not interchangeable
+with the new paired-feature classifier.
 
 ## Verification
 
-The module split was checked for Python 3.10 syntax, imports, CSV/Parquet input
-preparation, probability checks, label alignment, A/B restoration, source hashes,
-and real MLflow SQLite success/failure logging using synthetic model predictions.
-The compatibility unpickler was checked with a synthetic legacy model object.
-Actual GPU inference requires the original model artifacts and was not run here.
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+Tests exercise safe parsing, label QA, duplicate/conflict handling, grouped splits,
+A/B feature/label restoration, probability checks, real CPU gradient updates using
+tiny DeBERTa/Llama models, model save/reload equivalence, offline submission without
+training data, parameter audits, source hashing, and real MLflow SQLite success/failure
+logging. Tiny random models are test fixtures, not claimed predictive results.
+Full-size GPU training, 4-bit CUDA execution, and Kaggle leaderboard scoring require
+the actual environment and data; no performance scores are prefilled here.

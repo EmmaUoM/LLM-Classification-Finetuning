@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest==8.3.5
+peft==0.13.2
+faiss-cpu==1.10.0
