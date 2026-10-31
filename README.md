@@ -1,6 +1,6 @@
 # LLM Classification Ensemble with MLflow
 
-A modular version of `finetuning_test2_mlops.py`. It runs inference with existing
+A modular version of `finetuning_mlops.py`. It runs inference with existing
 Gemma2, Llama3, and custom DeBERTa checkpoints and combines their predictions.
 All comments and docstrings are in English. This project does not train models.
 
@@ -120,7 +120,7 @@ Each row must have exactly one winner. The example IDs must be replaced with
 your own input IDs. Evaluate on held-out examples:
 
 ```bash
-python main.py --input-root /kaggle/input \
+python main.py --input-root /input \
     --test-csv validation.csv --labels-csv validation_labels.csv \
     --run-name validation-ensemble
 ```
