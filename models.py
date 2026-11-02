@@ -128,7 +128,8 @@ class CustomDebertaModel(nn.Module):
 
 
 def hf_options(cfg, name):
-    options = {"local_files_only": bool(cfg.local_files_only or Path(cfg.model_sources[name]).is_dir()),
+    options = {"local_files_only": bool(name in {"gemma", "llama"} or cfg.local_files_only
+                                        or Path(cfg.model_sources[name]).is_dir()),
                "trust_remote_code": False}
     if cfg.model_revisions.get(name):
         options["revision"] = cfg.model_revisions[name]
@@ -136,7 +137,10 @@ def hf_options(cfg, name):
 
 
 def load_training_model(name, cfg):
+    cfg.resolve_training_sources(resolve_inputs=True)
     source, options = cfg.model_sources[name], hf_options(cfg, name)
+    if name in {"gemma", "llama"}:
+        sequence_checkpoint_layout(source)
     tokenizer = AutoTokenizer.from_pretrained(source, **options)
     tokenizer.padding_side = "right"
     if tokenizer.pad_token_id is None:

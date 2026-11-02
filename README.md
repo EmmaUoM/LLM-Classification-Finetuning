@@ -57,10 +57,9 @@ checkpoints' fused `gate_up_proj` and multi-layer `score` head using standard
 Transformers attention. Missing or unexpected weights in this layout are errors,
 so a path change cannot silently leave part of the model randomly initialized.
 
-Hugging Face models may be downloaded during training, or provided as local
-standard Hugging Face directories with `--local-files-only`. Gemma/Llama access
-may require accepting the model license and authenticating through your existing
-Hugging Face login or environment. Never put access tokens in committed files.
+The DeBERTa backbone may be downloaded during training or supplied as a local
+standard Hugging Face directory. Gemma/Llama training requires complete local
+checkpoints; missing Inputs and Hub IDs fail before any tokenizer or model download.
 
 ## Kaggle checkpoint Inputs
 
@@ -74,6 +73,10 @@ Add the following Inputs in the Kaggle notebook before running this project:
 | Competition CSVs | LLM Classification Finetuning competition Input |
 
 Both legacy mounts and `/kaggle/input/datasets/<owner>/<slug>` are recognized.
+Discovery also finds a unique model directory nested under a mounted dataset.
+It checks `config.json` for model checkpoints and `modules.json` for Sentence
+Transformers. Missing or ambiguous Inputs fail with instructions to attach the
+dataset or select an exact path; no guessed path or Hub fallback is returned.
 Gemma/Llama read these complete local checkpoints without a Hugging Face login.
 DeBERTa retains the current paired-feature architecture and defaults to
 `microsoft/deberta-v3-base`; provide a standard local backbone with
@@ -131,12 +134,21 @@ python main.py --mode train --input-root /kaggle/input \
     --output-dir /kaggle/working --train-backends deberta gemma llama
 ```
 
-Change individual model directories or pin Hub revisions with repeated
+Change individual model directories or pin the DeBERTa Hub revision with repeated
 `--model-source BACKEND=VALUE` and `--model-revision BACKEND=COMMIT_HASH` arguments.
 DeBERTa initializes from its standard pretrained backbone, while Gemma/Llama use
-the local Kaggle sources above. Explicit standard Hub sources are also supported
-through `--model-source`; gated Hub models require access to that repository.
-The loader distinguishes standard model layouts from the Kaggle fused layout.
+the local Kaggle sources above. Gemma/Llama accept local standard Hugging Face
+directories as well as the Kaggle fused layout. `--base-model BACKEND=DIRECTORY`
+and JSON `base_model_overrides` also override training sources; they take precedence
+over `model_sources` and are reapplied during validation, preflight, and model loading.
+Changing an override invalidates the previous source check, including in fold copies.
+
+Startup logs include `Pipeline version: kaggle-local-sources-v2` and the resolved
+training source for each enabled model. Default Kaggle Inputs are resolved before
+importing the ML stack. Submission only uses saved bundles and bases; it does not require the
+original checkpoint or Sentence Transformer Inputs. If using this project from an
+interactive notebook after replacing source files, restart the session and rerun
+configuration before training. Configuration objects from an older module are rejected.
 
 Use `python main.py --help` for CLI options. A JSON configuration can set any
 `Config` field; explicit CLI values override it.

@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from config import CLASS_COLUMNS, TEXT_COLUMNS, LOGGER
+from config import CLASS_COLUMNS, TEXT_COLUMNS, LOGGER, PIPELINE_VERSION, Config
 from data import clean_dataframe, load_labels, load_sentence_encoder, semantic_features, split_training_data
 from evaluation import classification_metrics, make_submission, validate_probabilities, weighted_ensemble
 from inference import predict_probabilities
@@ -34,6 +34,8 @@ def text_profile(frame):
 
 def preflight_training_sources(cfg):
     """Check every requested model before starting the first fine-tuning run."""
+    cfg.sources_preflight_done = False
+    cfg.resolve_training_sources(resolve_inputs=True)
     report, failures = {}, {}
     if "deberta" in cfg.train_backends and cfg.use_semantic_features:
         source = Path(cfg.sentence_model)
@@ -45,27 +47,29 @@ def preflight_training_sources(cfg):
         LOGGER.info("Checking %s: %s", name, source)
         try:
             options = hf_options(cfg, name)
-            model_config = AutoConfig.from_pretrained(source, **options)
+            layout = "standard HF"
+            if name in {"gemma", "llama"}:
+                model_config, fused = sequence_checkpoint_layout(source)
+                layout = "LMSYS fused MLP/head" if fused else layout
+            else:
+                model_config = AutoConfig.from_pretrained(source, **options)
             accepted = {"deberta", "deberta-v2"} if name == "deberta" else {
                 "gemma2" if name == "gemma" else "llama"}
             if model_config.model_type not in accepted:
                 raise ValueError(f"Expected {accepted}, got {model_config.model_type}")
-            layout = "standard HF"
-            if name in {"gemma", "llama"} and Path(source).is_dir():
-                _, fused = sequence_checkpoint_layout(source)
-                layout = "LMSYS fused MLP/head" if fused else layout
             tokenizer = AutoTokenizer.from_pretrained(source, **options)
             if tokenizer.pad_token_id is None and tokenizer.eos_token_id is None:
                 raise ValueError("Tokenizer has neither a pad nor an EOS token")
             report[name] = {"source": str(source), "status": "accessible", "layout": layout,
-                            "model_type": model_config.model_type}
+                            "model_type": model_config.model_type,
+                            "local_files_only": options["local_files_only"]}
             del tokenizer
         except Exception as error:
             failures[name] = f"{type(error).__name__}: {error}"
             report[name] = {"source": str(source), "status": "failed", "error": failures[name]}
     write_json(Path(cfg.output_root) / "training_preflight.json", report)
     if failures:
-        raise RuntimeError(f"Cannot train all requested models. Check Kaggle Inputs or explicit Hub sources: {failures}")
+        raise RuntimeError(f"Cannot train all requested models. Check attached Kaggle Inputs or local source overrides: {failures}")
     cfg.sources_preflight_done = True
 
 
@@ -358,9 +362,12 @@ def submission_pipeline(cfg, run_dir, tracker):
 
 
 def run_pipeline(cfg, run_dir=None, *, _cv_fold=False):
+    if not isinstance(cfg, Config):
+        raise RuntimeError("cfg belongs to another or older configuration module. Restart the session and recreate cfg.")
     cfg.validate()
     run_dir = create_run_directory(cfg) if run_dir is None else Path(run_dir)
     LOGGER.info("Run directory: %s", run_dir)
+    LOGGER.info("Pipeline version: %s", PIPELINE_VERSION)
     owns_manifest = cfg.mode == "train" and not _cv_fold
     if owns_manifest:
         cfg.training_group_id = run_dir.name

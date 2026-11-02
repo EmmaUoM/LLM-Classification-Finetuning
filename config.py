@@ -15,6 +15,7 @@ CLASS_COLUMNS = ["winner_model_a", "winner_model_b", "winner_tie"]
 TEXT_COLUMNS = ["prompt", "response_a", "response_b"]
 CLASS_SWAP = (1, 0, 2)
 ARCHITECTURE_VERSION = "paired-feature-deberta-v1"
+PIPELINE_VERSION = "kaggle-local-sources-v2"
 
 
 @dataclass
@@ -27,12 +28,12 @@ class Config:
     train_backends: tuple = ("deberta", "gemma", "llama")
     model_sources: dict = field(default_factory=lambda: {
         "deberta": "microsoft/deberta-v3-base",
-        "gemma": kaggle_input_path("lmsys-checkpoints-0-0805"),
-        "llama": kaggle_input_path("lmsys-checkpoints-3-0805"),
+        "gemma": "/kaggle/input/lmsys-checkpoints-0-0805",
+        "llama": "/kaggle/input/lmsys-checkpoints-3-0805",
     })
     model_revisions: dict = field(default_factory=dict)  # HF commit hashes if available
     inference_bundles: dict = field(default_factory=dict) # name -> one or more saved fold directories
-    base_model_overrides: dict = field(default_factory=dict) # local QLoRA base for submit
+    base_model_overrides: dict = field(default_factory=dict) # training sources OR saved submit bases
     local_files_only: bool = False             # forced True in submit mode
     n_splits: int = 5                           # train every grouped fold by default
     cross_validation: bool = True
@@ -59,8 +60,7 @@ class Config:
     swap_augmentation_probability: float = 0.5 # training only; labels and features swap too
     tta: bool = True                            # average both orders after class restoration
     use_semantic_features: bool = True
-    sentence_model: str = field(default_factory=lambda: kaggle_input_path(
-        "some-pack", "sentence-transformer-model"))
+    sentence_model: str = "/kaggle/input/some-pack/sentence-transformer-model"
     sentence_revision: str | None = None
     sentence_max_length: int = 256
     sentence_batch_size: int = 64
@@ -86,9 +86,37 @@ class Config:
     sources_preflight_done: bool = False
     auto_discover_roots: tuple = ("/kaggle/working", "/kaggle/input")
 
+    def resolve_training_sources(self, *, resolve_inputs=False):
+        """Apply overrides before preflight/loading, including independent fold copies.
+
+        Configuration parsing stays usable without mounted training Inputs. Runtime
+        entry points request strict local discovery before importing/loading models.
+        Submission mode only reads its saved bundles and never resolves raw Inputs.
+        """
+        if self.mode != "train":
+            return
+        resolved = {**self.model_sources, **self.base_model_overrides}
+        if resolved != self.model_sources:
+            self.sources_preflight_done = False
+        sentence_model = self.sentence_model
+        if resolve_inputs:
+            for name, slug in (("gemma", "lmsys-checkpoints-0-0805"),
+                               ("llama", "lmsys-checkpoints-3-0805")):
+                if name in self.train_backends and resolved.get(name) == f"/kaggle/input/{slug}":
+                    resolved[name] = kaggle_input_path(slug)
+            if ("deberta" in self.train_backends and self.use_semantic_features
+                    and sentence_model == "/kaggle/input/some-pack/sentence-transformer-model"):
+                sentence_model = kaggle_input_path(
+                    "some-pack", "sentence-transformer-model", required_file="modules.json")
+        if resolved != self.model_sources or sentence_model != self.sentence_model:
+            self.sources_preflight_done = False
+        self.model_sources = resolved
+        self.sentence_model = sentence_model
+
     def validate(self):
         if self.mode not in {"train", "submit"}:
             raise ValueError("mode must be 'train' or 'submit'")
+        self.resolve_training_sources()
         if not 0 <= self.seed < 2**32:
             raise ValueError("seed must be in [0, 2**32)")
         if not isinstance(self.inference_bundles, dict):
@@ -176,7 +204,7 @@ def parse_args(argv=None):
     parser.add_argument("--model-source", action="append", help="Repeat BACKEND=HF_ID_OR_DIRECTORY")
     parser.add_argument("--model-revision", action="append", help="Repeat BACKEND=HF_COMMIT_HASH")
     parser.add_argument("--bundle", action="append", help="Repeat BACKEND=SAVED_FOLD_DIRECTORY, including multiple folds of one model")
-    parser.add_argument("--base-model", action="append", help="Repeat BACKEND=LOCAL_QLORA_BASE_DIRECTORY")
+    parser.add_argument("--base-model", action="append", help="Repeat BACKEND=LOCAL_DIRECTORY for training source overrides or saved submit bases")
     parser.add_argument("--ensemble-weights", nargs=3, type=float, metavar=("GEMMA", "LLAMA", "DEBERTA"))
     parser.add_argument("--sentence-model")
     parser.add_argument("--sentence-revision")

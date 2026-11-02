@@ -7,7 +7,7 @@ import logging
 from dataclasses import asdict
 from pathlib import Path
 
-from config import LOGGER, parse_args
+from config import LOGGER, PIPELINE_VERSION, parse_args
 
 
 def configure_logging(run_dir):
@@ -32,7 +32,13 @@ def main(argv=None):
     configure_logging(run_dir)
     write_json(run_dir / "config.json", asdict(cfg))
     LOGGER.info("Run directory: %s", run_dir)
+    LOGGER.info("Pipeline version: %s", PIPELINE_VERSION)
     try:
+        if cfg.mode == "train":
+            cfg.resolve_training_sources(resolve_inputs=True)
+            write_json(run_dir / "config.json", asdict(cfg))
+            for name in cfg.train_backends:
+                LOGGER.info("Training source [%s]: %s", name, cfg.model_sources[name])
         if cfg.mode == "submit" and cfg.offline_wheelhouse and cfg.install_offline_dependencies:
             from submission_support import install_offline_dependencies
             install_offline_dependencies(cfg.offline_wheelhouse)

@@ -7,10 +7,11 @@ import pytest
 import torch
 from transformers import Gemma2Config, LlamaConfig
 
-from config import CLASS_COLUMNS, Config
+from config import CLASS_COLUMNS, PIPELINE_VERSION, Config
 from models import (KaggleGemmaForSequenceClassification, KaggleLlamaForSequenceClassification,
                     load_sequence_checkpoint, sequence_checkpoint_layout)
 import pipeline
+import models
 from utils import bundle_manifest
 
 
@@ -21,6 +22,55 @@ def tiny_config(config_class):
         max_position_embeddings=64, head_dim=8, query_pre_attn_scalar=8,
         sliding_window=32, use_cache=False,
     )
+
+
+def test_training_source_override_is_applied_in_preflight_and_direct_loading(tmp_path, monkeypatch):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+    directory = tmp_path / "local-llama"
+    KaggleLlamaForSequenceClassification(tiny_config(LlamaConfig)).save_pretrained(directory)
+    raw = Tokenizer(WordLevel({"[PAD]": 0, "[UNK]": 1, "[EOS]": 2}, unk_token="[UNK]"))
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=raw, pad_token="[PAD]",
+                                        unk_token="[UNK]", eos_token="[EOS]")
+    tokenizer.save_pretrained(directory)
+    cfg = Config(train_backends=("llama",), model_sources={"llama": "meta-llama/old-source"},
+                 base_model_overrides={"llama": str(directory)}, use_semantic_features=False,
+                 output_root=str(tmp_path / "output"))
+    pipeline.preflight_training_sources(cfg)
+    report = json.loads((tmp_path / "output" / "training_preflight.json").read_text())
+    assert report["llama"]["source"] == str(directory)
+    assert report["llama"]["local_files_only"]
+    assert cfg.sources_preflight_done
+    cfg.model_sources = {"llama": "meta-llama/old-source"}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="NVIDIA CUDA GPU"):
+        models.load_training_model("llama", cfg)
+    assert cfg.model_sources["llama"] == str(directory)
+    assert not cfg.sources_preflight_done
+
+
+def test_gemma_training_rejects_hub_sources_before_any_hub_request(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("Attempted a Hub config or tokenizer request")
+
+    monkeypatch.setattr(pipeline.AutoConfig, "from_pretrained", fail)
+    monkeypatch.setattr(pipeline.AutoTokenizer, "from_pretrained", fail)
+    cfg = Config(train_backends=("gemma",), model_sources={"gemma": "google/gemma-2-9b-it"},
+                 use_semantic_features=False, output_root=str(tmp_path))
+    assert models.hf_options(cfg, "gemma")["local_files_only"]
+    with pytest.raises(RuntimeError, match="Cannot train all requested models"):
+        pipeline.preflight_training_sources(cfg)
+    with pytest.raises(FileNotFoundError, match="Attach the Kaggle model Input"):
+        models.load_training_model("gemma", cfg)
+    assert not cfg.sources_preflight_done
+
+
+def test_pipeline_reports_version_and_rejects_stale_configuration_objects():
+    from types import SimpleNamespace
+    assert pipeline.PIPELINE_VERSION == PIPELINE_VERSION == "kaggle-local-sources-v2"
+    with pytest.raises(RuntimeError, match="older configuration module"):
+        pipeline.run_pipeline(SimpleNamespace(mode="train"))
 
 
 @pytest.mark.parametrize("model_class,config_class", [

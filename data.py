@@ -223,7 +223,8 @@ def semantic_features(frame, sentence_encoder, batch_size):
 def load_sentence_encoder(source, cfg, revision=None):
     from sentence_transformers import SentenceTransformer
     options = {"device": "cuda:0" if torch.cuda.is_available() else "cpu",
-               "local_files_only": cfg.local_files_only, "trust_remote_code": False}
+               "local_files_only": bool(cfg.local_files_only or Path(source).is_dir()),
+               "trust_remote_code": False}
     if revision:
         options["revision"] = revision
     encoder = SentenceTransformer(str(source), **options)

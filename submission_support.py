@@ -288,13 +288,26 @@ def prepare_offline_wheelhouse(requirements, output_root):
     return str(directory)
 
 
-def kaggle_input_path(slug, subdirectory="", input_root="/kaggle/input"):
-    """Support both legacy mounts and /kaggle/input/datasets/<owner>/<slug>."""
+def kaggle_input_path(slug, subdirectory="", required_file="config.json", input_root="/kaggle/input"):
+    """Resolve one mounted model directory, with no fallback to a Hub model ID."""
     root = Path(input_root)
-    candidates = [root / slug / subdirectory]
-    candidates += [directory / subdirectory
-                   for directory in sorted(root.glob(f"datasets/*/{slug}"))]
-    matches = {str(directory.resolve()) for directory in candidates if directory.is_dir()}
-    if len(matches) > 1:
-        raise ValueError(f"Multiple {slug} Inputs found; set its exact path: {sorted(matches)}")
-    return next(iter(matches)) if matches else str(candidates[0])
+    datasets = [root / slug, *sorted(root.glob(f"datasets/*/{slug}"))]
+    datasets = {directory.resolve() for directory in datasets if directory.is_dir()}
+    if not datasets:
+        raise FileNotFoundError(
+            f"Kaggle Input '{slug}' is not attached. Add it with Add Input, "
+            f"or set its actual local path in the configuration. Searched under {root}.")
+    matches = set()
+    for dataset in datasets:
+        preferred = dataset / subdirectory
+        if (preferred / required_file).is_file():
+            matches.add(str(preferred.resolve()))
+        else:
+            matches.update(str(path.parent.resolve()) for path in dataset.rglob(required_file))
+    if not matches:
+        raise FileNotFoundError(
+            f"Input '{slug}' has no {required_file}. Select the complete model directory "
+            f"from the Input panel. Mounted roots: {sorted(map(str, datasets))}")
+    if len(matches) != 1:
+        raise ValueError(f"Multiple model directories in '{slug}'; set the exact path: {sorted(matches)}")
+    return matches.pop()
