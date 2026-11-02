@@ -32,8 +32,9 @@ class Config:
     inference_bundles: dict = field(default_factory=dict) # name -> saved bundle directory
     base_model_overrides: dict = field(default_factory=dict) # local QLoRA base for submit
     local_files_only: bool = False             # forced True in submit mode
-    n_splits: int = 5                           # first grouped fold is validation
-    holdout_fold: int = 0
+    n_splits: int = 5                           # train every grouped fold by default
+    cross_validation: bool = True
+    holdout_fold: int = 0                      # used only with cross_validation=False
     max_train_rows: int | None = None           # debugging only; None uses all train rows
     max_val_rows: int | None = None
     epochs: int = 3
@@ -114,6 +115,8 @@ class Config:
                 raise ValueError(f"{key} must be finite and positive")
         if not 2 <= self.n_splits or not 0 <= self.holdout_fold < self.n_splits:
             raise ValueError("Invalid grouped holdout settings")
+        if not isinstance(self.cross_validation, bool):
+            raise ValueError("cross_validation must be a boolean")
         if not 0 <= self.warmup_ratio < 1 or self.num_workers < 0:
             raise ValueError("Invalid warmup_ratio or num_workers")
         for key in ("max_train_rows", "max_val_rows"):
@@ -155,6 +158,10 @@ def parse_args(argv=None):
     parser.add_argument("--sentence-revision")
     parser.add_argument("--experiment-name")
     parser.add_argument("--run-name")
+    parser.add_argument("--cross-validation", dest="cross_validation", action="store_true",
+                        help="Train every grouped fold (default)")
+    parser.add_argument("--single-fold", dest="cross_validation", action="store_false",
+                        help="Train only --holdout-fold instead of all folds")
     for option in ("seed", "n_splits", "holdout_fold", "epochs", "patience", "max_train_rows", "max_val_rows",
                    "deberta_max_length", "llm_max_length", "deberta_batch_size", "llm_batch_size",
                    "eval_batch_size", "grad_accum_steps", "num_workers", "sentence_max_length",

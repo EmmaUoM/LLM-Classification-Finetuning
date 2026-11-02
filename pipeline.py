@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import traceback
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -124,6 +126,87 @@ def train_pipeline(cfg, run_dir, tracker):
             "validation_metrics": metrics, "normalized_weights": weights}
 
 
+def cross_validation_pipeline(cfg, run_dir):
+    """Run independent grouped folds and combine only their held-out predictions."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    write_json(run_dir / "config.json", asdict(cfg))
+    fold_results, fold_rows, oof_parts = [], [], []
+    progress = {"status": "RUNNING", "n_splits": cfg.n_splits, "completed_folds": []}
+    write_json(run_dir / "cv_progress.json", progress)
+    summary_tracker = RunTracker(cfg, run_dir)
+    try:
+        cleaned, _, _ = clean_dataframe(pd.read_csv(cfg.train_csv, dtype={"id": str}), training=True)
+        expected = cleaned.set_index("id")
+        seen_ids = set()
+        for fold in range(cfg.n_splits):
+            LOGGER.info("Training fold %s/%s", fold + 1, cfg.n_splits)
+            fold_cfg = replace(cfg, cross_validation=False, holdout_fold=fold)
+            fold_dir = run_dir / "folds" / f"fold_{fold}"
+            fold_dir.mkdir(parents=True, exist_ok=False)
+            # Each call loads fresh pretrained models and closes its own MLflow run.
+            result = run_pipeline(fold_cfg, run_dir=fold_dir)
+            predictions = pd.read_csv(fold_dir / "ensemble_validation_predictions.csv", dtype={"id": str})
+            ids = set(predictions.id)
+            if predictions.id.duplicated().any() or ids & seen_ids:
+                raise ValueError("A row received out-of-fold predictions more than once")
+            if not ids <= set(expected.index):
+                raise ValueError("Out-of-fold predictions contain unknown training IDs")
+            if not np.array_equal(predictions.true_label.to_numpy(), expected.loc[predictions.id, "label"].to_numpy()):
+                raise ValueError("Out-of-fold labels do not match the cleaned training data")
+            seen_ids.update(ids)
+            predictions["fold"] = fold
+            oof_parts.append(predictions)
+            fold_results.append({"fold": fold, **result})
+            fold_rows.append({"fold": fold, **result["validation_metrics"],
+                              "run_directory": str(fold_dir)})
+            pd.DataFrame(fold_rows).to_csv(run_dir / "fold_metrics.csv", index=False)
+            progress["completed_folds"].append(fold)
+            write_json(run_dir / "cv_progress.json", progress)
+
+        if cfg.max_val_rows is None and seen_ids != set(expected.index):
+            raise ValueError("Cross-validation did not validate every cleaned training row exactly once")
+        oof = pd.concat(oof_parts, ignore_index=True)
+        oof["_source_row"] = oof.id.map(expected._source_row)
+        oof = oof.sort_values("_source_row").drop(columns="_source_row").reset_index(drop=True)
+        oof.to_csv(run_dir / "oof_predictions.csv", index=False)
+        oof_metrics = classification_metrics(oof.true_label.to_numpy(), oof[CLASS_COLUMNS].to_numpy())
+        metric_columns = ["log_loss", "accuracy", "macro_f1"]
+        scores = pd.DataFrame(fold_rows)[metric_columns]
+        summary = {
+            "n_splits": cfg.n_splits, "completed_folds": len(fold_results),
+            "fold_metrics_mean": scores.mean().to_dict(),
+            "fold_metrics_std": scores.std(ddof=1).to_dict(),
+            "oof_metrics": oof_metrics, "oof_rows": len(oof), "cleaned_rows": len(cleaned),
+            "validation_coverage_complete": seen_ids == set(expected.index),
+            "full_data": cfg.max_train_rows is None and cfg.max_val_rows is None,
+            "scope": "Grouped development cross-validation; each fold selects its epoch using its validation labels. Not an untouched final test.",
+        }
+        write_json(run_dir / "cv_summary.json", summary)
+        # Start the summary tracking run after the fold runs have all closed.
+        with summary_tracker as tracker:
+            tracker.metrics({f"cv_mean_{key}": value for key, value in summary["fold_metrics_mean"].items()})
+            tracker.metrics({f"cv_std_{key}": value for key, value in summary["fold_metrics_std"].items()})
+            tracker.metrics({f"oof_{key}": value for key, value in oof_metrics.items()})
+            result = {"fold_results": fold_results, "validation_metrics": oof_metrics,
+                      "cv_summary": summary, "run_directory": str(run_dir),
+                      "mlflow_run_id": tracker.run_id}
+            write_json(run_dir / "result.json", result)
+            for name in ("fold_metrics.csv", "oof_predictions.csv", "cv_summary.json", "result.json"):
+                tracker.artifact(run_dir / name)
+        progress["status"] = "FINISHED"
+        write_json(run_dir / "cv_progress.json", progress)
+        LOGGER.info("Completed %s folds. OOF metrics: %s", cfg.n_splits, oof_metrics)
+        return result
+    except BaseException as error:
+        progress.update(status="FAILED", exception_type=type(error).__name__, message=str(error))
+        write_json(run_dir / "cv_progress.json", progress)
+        if not (run_dir / "run_summary.json").exists():
+            write_json(run_dir / "run_summary.json", {**progress, "mode": cfg.mode,
+                       "run_directory": str(run_dir)})
+        (run_dir / "failure.txt").write_text(traceback.format_exc(), encoding="utf-8")
+        raise
+
+
 def submission_pipeline(cfg, run_dir, tracker):
     # train.csv is intentionally never read in this mode.
     with track_stage("test_validation_and_cleaning", tracker):
@@ -198,6 +281,8 @@ def run_pipeline(cfg, run_dir=None):
     cfg.validate()
     run_dir = create_run_directory(cfg) if run_dir is None else Path(run_dir)
     LOGGER.info("Run directory: %s", run_dir)
+    if cfg.mode == "train" and cfg.cross_validation:
+        return cross_validation_pipeline(cfg, run_dir)
     with RunTracker(cfg, run_dir) as tracker:
         with track_stage("preflight", tracker):
             set_seeds(cfg.seed)

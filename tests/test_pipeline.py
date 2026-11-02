@@ -149,9 +149,112 @@ def trained_project(tmp_path_factory, tokenizer):
     sentence_encoder.save_pretrained(str(sentence_path))
     train_path = directory / 'train.csv'
     pd.DataFrame([example(i) for i in range(61)]).to_csv(train_path, index=False)
-    cfg = config.Config(train_csv=str(train_path), output_root=str(directory / 'output'), epochs=2, patience=3, deberta_batch_size=5, grad_accum_steps=3, eval_batch_size=6, deberta_max_length=64, sentence_max_length=32, sentence_model=str(sentence_path), model_sources={'deberta': str(source)}, allow_cpu_training=True, local_files_only=True, use_amp=False, enable_mlflow=False, encoder_lr=0.001, head_lr=0.001, source_snapshot=str(ROOT))
+    cfg = config.Config(cross_validation=False, train_csv=str(train_path), output_root=str(directory / 'output'), epochs=2, patience=3, deberta_batch_size=5, grad_accum_steps=3, eval_batch_size=6, deberta_max_length=64, sentence_max_length=32, sentence_model=str(sentence_path), model_sources={'deberta': str(source)}, allow_cpu_training=True, local_files_only=True, use_amp=False, enable_mlflow=False, encoder_lr=0.001, head_lr=0.001, source_snapshot=str(ROOT))
     result = pipeline.run_pipeline(cfg)
     return (directory, cfg, result)
+
+def test_complete_five_fold_training_and_oof_metrics(trained_project, monkeypatch):
+    from dataclasses import replace
+    import mlflow
+    directory, base_cfg, _ = trained_project
+    cfg = replace(base_cfg, cross_validation=True, epochs=1, use_semantic_features=False,
+                  enable_mlflow=True, output_root=str(directory / 'cv_output'))
+    initial_weights = []
+    original_factory = training.load_training_model
+
+    def watch_initialization(name, settings):
+        model, tokenizer = original_factory(name, settings)
+        initial_weights.append(model.encoder.embeddings.word_embeddings.weight.detach().cpu().clone())
+        return model, tokenizer
+
+    monkeypatch.setattr(training, 'load_training_model', watch_initialization)
+    result = pipeline.run_pipeline(cfg)
+    assert cfg.cross_validation and cfg.holdout_fold == base_cfg.holdout_fold
+    assert len(initial_weights) == 5
+    assert all(torch.equal(initial_weights[0], weights) for weights in initial_weights[1:])
+    root = Path(result['run_directory'])
+    oof = pd.read_csv(root / 'oof_predictions.csv', dtype={'id': str})
+    cleaned, _, _ = data.clean_dataframe(pd.read_csv(cfg.train_csv, dtype={'id': str}), True)
+    assert oof.id.tolist() == cleaned.id.tolist()
+    assert not oof.id.duplicated().any()
+    assert set(oof.fold) == set(range(5))
+    for fold_result in result['fold_results']:
+        fold = fold_result['fold']
+        fold_dir = Path(fold_result['run_directory'])
+        train = pd.read_csv(fold_dir / 'train_split.csv', dtype={'id': str})
+        valid = pd.read_csv(fold_dir / 'validation_split.csv', dtype={'id': str})
+        assert set(oof.loc[oof.fold == fold, 'id']) == set(valid.id)
+        assert not set(train._prompt_group) & set(valid._prompt_group)
+        assert not set(train.id) & set(valid.id)
+        assert json.loads((fold_dir / 'run_summary.json').read_text())['status'] == 'FINISHED'
+        bundle = Path(fold_result['model_bundles']['deberta'])
+        assert utils.verify_bundle(bundle)
+        assert json.loads((bundle / 'training_update_audit.json').read_text())['real_parameter_update_verified']
+    summary = json.loads((root / 'cv_summary.json').read_text())
+    assert summary['completed_folds'] == 5
+    assert summary['validation_coverage_complete'] and summary['full_data']
+    assert summary['oof_rows'] == summary['cleaned_rows'] == len(cleaned)
+    scores = pd.read_csv(root / 'fold_metrics.csv')
+    for metric in ['log_loss', 'accuracy', 'macro_f1']:
+        assert summary['fold_metrics_mean'][metric] == pytest.approx(scores[metric].mean())
+        assert summary['fold_metrics_std'][metric] == pytest.approx(scores[metric].std(ddof=1))
+    expected = evaluation.classification_metrics(oof.true_label.to_numpy(), oof[config.CLASS_COLUMNS].to_numpy())
+    assert summary['oof_metrics'] == pytest.approx(expected)
+    assert json.loads((root / 'cv_progress.json').read_text()) == {
+        'status': 'FINISHED', 'n_splits': 5, 'completed_folds': [0, 1, 2, 3, 4]}
+    run_summary = json.loads((root / 'run_summary.json').read_text())
+    assert run_summary['status'] == 'FINISHED'
+    fold_seconds = sum(json.loads((Path(item['run_directory']) / 'run_summary.json').read_text())['seconds']
+                       for item in result['fold_results'])
+    assert run_summary['seconds'] >= fold_seconds
+    client = mlflow.tracking.MlflowClient()
+    runs = client.search_runs([client.get_experiment_by_name(cfg.experiment_name).experiment_id])
+    assert len(runs) == 6 and all(run.info.status == 'FINISHED' for run in runs)
+    assert client.get_run(result['mlflow_run_id']).data.tags['validation'] == 'grouped_development_cross_validation'
+    assert client.get_run(result['mlflow_run_id']).data.metrics['oof_log_loss'] == pytest.approx(expected['log_loss'])
+
+
+@pytest.mark.parametrize('problem', ['failure', 'duplicate', 'missing', 'wrong_label'])
+def test_cv_rejects_incomplete_or_invalid_results(tmp_path, monkeypatch, problem):
+    path = tmp_path / 'train.csv'
+    pd.DataFrame([example(i) for i in range(90)]).to_csv(path, index=False)
+    cfg = config.Config(train_csv=str(path), output_root=str(tmp_path),
+                        allow_cpu_training=True, enable_mlflow=False, use_semantic_features=False)
+
+    def fake_train(settings, run_dir, tracker):
+        if problem == 'failure' and settings.holdout_fold == 2:
+            raise RuntimeError('deliberate fold failure')
+        cleaned, _, _ = data.clean_dataframe(pd.read_csv(path, dtype={'id': str}), True)
+        _, valid = data.split_training_data(cleaned, settings)
+        out = pd.DataFrame(np.full((len(valid), 3), 1 / 3), columns=config.CLASS_COLUMNS)
+        out.insert(0, 'id', valid.id.to_numpy())
+        out['true_label'] = valid.label.to_numpy()
+        metrics = evaluation.classification_metrics(valid.label.to_numpy(), out[config.CLASS_COLUMNS].to_numpy())
+        if settings.holdout_fold == 0:
+            if problem == 'duplicate':
+                out.loc[1, 'id'] = out.loc[0, 'id']
+            elif problem == 'missing':
+                out = out.iloc[1:]
+            elif problem == 'wrong_label':
+                out.loc[0, 'true_label'] = (out.loc[0, 'true_label'] + 1) % 3
+        out.to_csv(run_dir / 'ensemble_validation_predictions.csv', index=False)
+        return {'model_bundles': {}, 'validation_metrics': metrics}
+
+    monkeypatch.setattr(pipeline, 'train_pipeline', fake_train)
+    error_type = RuntimeError if problem == 'failure' else ValueError
+    with pytest.raises(error_type):
+        pipeline.run_pipeline(cfg)
+    root = next((tmp_path / 'runs').iterdir())
+    assert json.loads((root / 'run_summary.json').read_text())['status'] == 'FAILED'
+    progress = json.loads((root / 'cv_progress.json').read_text())
+    assert progress['status'] == 'FAILED'
+    if problem == 'failure':
+        assert progress['completed_folds'] == [0, 1]
+        assert len(pd.read_csv(root / 'fold_metrics.csv')) == 2
+        assert json.loads((root / 'folds/fold_2/run_summary.json').read_text())['status'] == 'FAILED'
+    assert not (root / 'cv_summary.json').exists()
+    assert not (root / 'result.json').exists()
+
 
 def test_real_backprop_updates_encoder_features_and_classifier(trained_project):
     _, cfg, result = trained_project
