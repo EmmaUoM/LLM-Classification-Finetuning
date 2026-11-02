@@ -47,6 +47,21 @@ def test_cli_merges_json_then_explicit_overrides(tmp_path):
         config.parse_args(["--ensemble-weights", "1", "0", "0"])
 
 
+def test_cli_defaults_to_all_folds_and_supports_explicit_single_fold(tmp_path):
+    cfg = config.parse_args([])
+    assert cfg.cross_validation and cfg.n_splits == 5
+    cfg = config.parse_args(["--single-fold", "--holdout-fold", "2"])
+    assert not cfg.cross_validation and cfg.holdout_fold == 2
+    source = tmp_path / "single_fold.json"
+    source.write_text(json.dumps({"cross_validation": False, "n_splits": 3}))
+    assert not config.parse_args(["--config", str(source)]).cross_validation
+    cfg = config.parse_args(["--config", str(source), "--cross-validation"])
+    assert cfg.cross_validation and cfg.n_splits == 3
+    source.write_text(json.dumps({"cross_validation": "false"}))
+    with pytest.raises(SystemExit):
+        config.parse_args(["--config", str(source)])
+
+
 def test_labels_align_by_id_and_swapping_restores_features(tmp_path):
     path = tmp_path / "labels.csv"
     pd.DataFrame({"id": ["9", "3"], "winner_model_a": [1, 0], "winner_model_b": [0, 0],

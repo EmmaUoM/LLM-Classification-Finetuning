@@ -3,7 +3,7 @@
 Predict whether a human prefers response A, response B, or a tie for the same prompt.
 This project is the modular Python version of the updated `finetuning-emma.ipynb`.
 It includes real fine-tuning on the competition training set, data cleaning,
-group-disjoint development validation, model bundles, and separate offline inference.
+complete grouped five-fold development cross-validation, model bundles, and separate offline inference.
 
 The default trains the custom DeBERTa branch. Gemma 2 and Llama 3 can also be
 fine-tuned sequentially using 4-bit NF4 weights, LoRA adapters, and a trainable
@@ -60,8 +60,9 @@ Hugging Face login or environment. Never put access tokens in committed files.
 
 ## Train
 
-Attach the Kaggle competition data and enable GPU access. By default, all cleaned
-rows assigned to the training partition are used for three epochs:
+Attach the Kaggle competition data and enable GPU access. By default, training
+visits all five grouped folds. Each fold initializes fresh models, trains on its
+other four partitions for up to three epochs, and saves its own best checkpoints:
 
 ```bash
 python main.py --mode train \
@@ -81,7 +82,7 @@ Start with a smaller end-to-end run before a complete training job:
 python main.py --mode train \
     --input-root /kaggle/input \
     --output-dir /kaggle/working \
-    --max-train-rows 1000 --max-val-rows 300 --epochs 1
+    --single-fold --max-train-rows 1000 --max-val-rows 300 --epochs 1
 ```
 
 Use local pretrained models when Internet is unavailable:
@@ -110,6 +111,13 @@ assumed to be standard Hugging Face bases.
 Use `python main.py --help` for CLI options. A JSON configuration can set any
 `Config` field; explicit CLI values override it.
 
+Full cross-validation is the default (`cross_validation: true`, `n_splits: 5`).
+For one selected fold, use `--single-fold --holdout-fold 2`, or set
+`cross_validation: false` in JSON. `--cross-validation` overrides a single-fold
+JSON configuration. Keep `max_train_rows` and `max_val_rows` unset for a full-data
+run. With three backends enabled, five folds train 15 models sequentially; expect
+roughly five times the work of the old single-fold run.
+
 ## Cleaning and validation
 
 Input CSVs need unique test IDs and the columns `prompt`, `response_a`, and
@@ -125,9 +133,12 @@ line structure, and code indentation. Invalid training labels/rows are reported
 and removed. Duplicate pairs include A/B-reversed pairs; conflicting pair labels
 are removed together. Test rows and their ID order are preserved.
 
-The development holdout is produced by `StratifiedGroupKFold` using the complete
-normalized prompt as the group. The default is one of five folds, approximately
-20% validation. The same prompt and duplicate response pair cannot cross the split.
+Development folds are produced by `StratifiedGroupKFold` using the complete
+normalized prompt as the group. All five folds are visited by default, with
+approximately 20% validation in each fold. The same prompt and duplicate response
+pair cannot cross a fold's training/validation split. The seed and split definition
+stay fixed across folds, so every cleaned row is validated exactly once in a
+full-data run. The pipeline rejects duplicate or missing out-of-fold predictions.
 Only the training partition receives random A/B augmentation; labels and features
 are swapped consistently. Model-name and fold columns are not used as features.
 
@@ -135,9 +146,10 @@ Three text components receive separate token budgets, with unused space assigned
 to longer components. This avoids truncating away the whole second answer just
 because it appears at the end of a concatenation.
 
-The holdout selects the best epoch and supports early stopping. It is a development
-set, not an untouched final test. A competition-finetuned starting checkpoint may
-already have seen holdout examples; audit its provenance before interpreting scores.
+Each fold's validation set selects its best epoch and supports early stopping.
+Fold and out-of-fold scores are development estimates, not an untouched final test.
+A competition-finetuned starting checkpoint may already have seen validation
+examples; audit its provenance before interpreting scores.
 There is no implicit full-data retraining after model selection.
 
 ## Semantic features and FAISS
@@ -157,12 +169,34 @@ expected by a trained model.
 
 ## Saved models and inference
 
-Every execution gets an isolated directory under `<output-dir>/runs/`:
+Every execution gets an isolated directory under `<output-dir>/runs/`. A default
+cross-validation run contains:
+
+```text
+runs/<run_id>/
+  config.json and pipeline.log
+  cv_progress.json
+  fold_metrics.csv
+  oof_predictions.csv
+  cv_summary.json
+  result.json and run_summary.json
+  folds/fold_0/ ... folds/fold_4/
+```
+
+`fold_metrics.csv` contains each fold's ensemble validation metrics.
+`cv_summary.json` includes their unweighted means and sample standard deviations,
+plus metrics computed from pooled out-of-fold (OOF) probabilities. These are
+separate summaries; pooled metrics need not equal the fold means. OOF rows retain
+the cleaned source order, with one prediction per validated ID and a `fold` column.
+The summary records validation coverage and whether row limits were enabled;
+sampled debugging runs are not presented as full-data validation.
+`cv_progress.json` retains completed fold IDs if training fails partway through.
+
+Each fold directory (or a `--single-fold` run directory) contains:
 
 ```text
 runs/<run_id>/
   config.json
-  pipeline.log
   source/ and source_manifest.json
   data_quality_report.json
   train_split.csv and validation_split.csv
@@ -188,10 +222,14 @@ run, supply a saved bundle and the current test data:
 ```bash
 python main.py --mode submit \
     --input-root /kaggle/input --output-dir /kaggle/working \
-    --bundle deberta=/kaggle/input/my-trained-models/runs/TRAIN_RUN_ID/models/deberta
+    --bundle deberta=/kaggle/input/my-trained-models/runs/TRAIN_RUN_ID/folds/fold_0/models/deberta
 ```
 
 Or edit the placeholder path in `configs/submit.example.json` and pass `--config`.
+The command above loads one fold's model. Each fold writes its own
+`inference_config_example.json`, and the CV `result.json` lists all `fold_results`.
+The current `--bundle` option accepts one directory per backend; it does not
+automatically average all five fold models.
 For Gemma/Llama, also repeat `--base-model BACKEND=LOCAL_BASE_DIRECTORY` as needed.
 Submission mode forces offline model loading and never reads `train.csv`.
 
@@ -228,7 +266,9 @@ contain valid one-hot labels. Rows are joined by ID, not assumed to share order.
 MLflow is enabled by default and stores metadata in `<output-dir>/mlflow.db`,
 with artifacts in `<output-dir>/mlartifacts/`. It tracks configuration, source/data
 fingerprints, package versions, stage times, peak GPU allocation, model artifacts,
-and run status. Source snapshots include all maintained modules, tests, configuration
+and run status. Each fold has its own tracking run; a separate summary run records
+CV means, standard deviations, and OOF metrics after all folds finish, avoiding
+overlapping active MLflow runs. Source snapshots include all maintained modules, tests, configuration
 examples, and dependency files. Failures retain local diagnostics and are marked
 failed when a tracking run has started.
 
@@ -260,6 +300,8 @@ python -m pytest -q
 ```
 
 Tests exercise safe parsing, label QA, duplicate/conflict handling, grouped splits,
+complete five-fold training, exact OOF coverage, independent model initialization,
+CV metric aggregation and failure reporting,
 A/B feature/label restoration, probability checks, real CPU gradient updates using
 tiny DeBERTa/Llama models, model save/reload equivalence, offline submission without
 training data, parameter audits, source hashing, and real MLflow SQLite success/failure

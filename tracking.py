@@ -60,7 +60,8 @@ class RunTracker:
                 self.run_id = run.info.run_id
                 mlflow.set_tags({"task": "human_preference_classification", "mode": self.cfg.mode,
                                  "class_order": ",".join(CLASS_COLUMNS),
-                                 "validation": ("grouped_development_holdout" if self.cfg.mode == "train" else
+                                 "validation": ("grouped_development_cross_validation" if self.cfg.mode == "train" and self.cfg.cross_validation else
+                                                "grouped_development_holdout" if self.cfg.mode == "train" else
                                                 "explicit_label_csv" if self.cfg.labels_csv else "unlabeled")})
                 mlflow.log_params({k: json.dumps(v, default=str) if isinstance(v, (list, tuple, dict)) else v
                                    for k, v in asdict(self.cfg).items() if v is not None})

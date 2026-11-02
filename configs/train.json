@@ -3,6 +3,8 @@
   "train_csv": "/kaggle/input/llm-classification-finetuning/train.csv",
   "output_root": "/kaggle/working",
   "train_backends": ["deberta"],
+  "n_splits": 5,
+  "cross_validation": true,
   "epochs": 3,
   "deberta_batch_size": 4,
   "grad_accum_steps": 8,
