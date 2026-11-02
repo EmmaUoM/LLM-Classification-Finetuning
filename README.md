@@ -20,7 +20,7 @@ Keep the Python modules together in the repository root.
 | --- | --- |
 | `main.py` | Command-line entry point, run directories, logs, and failure handling |
 | `config.py` | Arguments, shared class order, configuration, and logger |
-| `data.py` | CSV validation and cleaning, grouped splits, A/B-swapped inputs, real labels, paired semantic features, and optional FAISS features |
+| `data.py` | CSV validation and cleaning, grouped splits, A/B-swapped inputs, real labels, and paired semantic features |
 | `models.py` | Custom DeBERTa, Kaggle fused-checkpoint compatibility, QLoRA factories, shared 4-bit bases, model bundles, and legacy loading |
 | `inference.py` | Gemma 2, Llama 3, and custom classifier inference with A/B restoration |
 | `evaluation.py` | Probability checks, weighted ensemble, and evaluation metrics |
@@ -32,7 +32,6 @@ Keep the Python modules together in the repository root.
 | `requirements-mlops.txt` | Additional MLflow dependencies |
 | `requirements.txt` | DeBERTa and tracking runtime |
 | `requirements-qlora.txt` | Default three-model runtime, including Gemma/Llama QLoRA |
-| `requirements-faiss.txt` | Optional FAISS retrieval-feature dependencies |
 | `requirements-dev.txt` | Test dependencies |
 | `configs/` | Training and inference JSON configuration examples |
 | `tests/` | CPU behavior, checkpoint round-trip, CLI, and MLflow integration checks |
@@ -194,20 +193,16 @@ A competition-finetuned starting checkpoint may already have seen validation
 examples; audit its provenance before interpreting scores.
 There is no implicit full-data retraining after model selection.
 
-## Semantic features and FAISS
+## Semantic features
 
 The custom classifier uses a DeBERTa text representation plus two cosine features:
 `cos(prompt_i, response_a_i)` and `cos(prompt_i, response_b_i)`. The frozen sentence
 encoder is saved with the custom model bundle. Direct MLP feature fusion replaces
 the old single-key attention block.
 
-Paired cosine is the default and does not require FAISS. It does not search other
+Cosine features compare each response with its own prompt. They do not search other
 prompts in the current test batch, so a row's features are independent of unrelated
-test rows. `data.FaissPromptIndex` is an optional utility for retrieval experiments:
-fit it on training-prompt embeddings only, then transform response embeddings
-against that fixed reference index. Install `requirements-faiss.txt` to use it.
-Its retrieval features must not be silently substituted for the paired features
-expected by a trained model.
+test rows. Training and inference use the same paired-feature definition.
 
 ## Saved models and inference
 

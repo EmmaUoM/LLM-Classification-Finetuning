@@ -1,2 +1,0 @@
--r requirements.txt
-faiss-cpu==1.10.0

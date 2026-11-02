@@ -7,7 +7,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -75,16 +74,6 @@ def test_labels_align_by_id_and_swapping_restores_features(tmp_path):
     assert swapped.loc[0, "response_a"] == "b" and swapped.loc[0, "label"] == 1
     assert swapped.loc[0, "similarity_a"] == 0.8
     pd.testing.assert_frame_equal(data.swap_responses(swapped), frame)
-
-
-def test_faiss_uses_a_fixed_reference_and_does_not_refit_on_queries():
-    pytest.importorskip("faiss")
-    index = data.FaissPromptIndex(np.array([[1, 0]], dtype=float))
-    result = index.transform([[0, 1]], [[1, 0]])
-    np.testing.assert_allclose(result, [[0, 1]])
-    extended = index.transform([[0, 1], [1, 0]], [[1, 0], [0, 1]])
-    np.testing.assert_allclose(extended[:1], result)
-    assert index.index.ntotal == 1
 
 
 def test_source_manifest_is_portable_and_detects_edits(tmp_path):

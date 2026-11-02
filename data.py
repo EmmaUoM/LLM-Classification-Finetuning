@@ -358,34 +358,3 @@ def prepare_test_files(test_csv, output_dir):
     frame[["id", *TEXT_COLUMNS]].to_parquet(output_dir / "test.parquet", index=False)
     swap_responses(frame)[["id", *TEXT_COLUMNS]].to_parquet(output_dir / "test_swap.parquet", index=False)
     return frame
-
-
-class FaissPromptIndex:
-    """Optional retrieval features against a FIXED reference set of training prompts.
-
-    The main classifier uses paired cosine features. This helper supports retrieval
-    experiments while avoiding an index constructed from the current test batch.
-    Training/validation code must fit this index on the training partition only.
-    """
-    def __init__(self, training_prompt_embeddings):
-        import faiss
-        matrix = self._normalize(training_prompt_embeddings)
-        if not len(matrix):
-            raise ValueError("The FAISS reference prompt matrix is empty")
-        self.dimension = matrix.shape[1]
-        self.index = faiss.IndexFlatIP(self.dimension)
-        self.index.add(matrix)
-
-    @staticmethod
-    def _normalize(values):
-        matrix = np.asarray(values, dtype=np.float32)
-        if matrix.ndim != 2 or matrix.shape[1] < 1 or not np.isfinite(matrix).all():
-            raise ValueError("FAISS vectors must be a finite two-dimensional matrix")
-        matrix = matrix / np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
-        return np.ascontiguousarray(matrix)
-
-    def transform(self, response_a_embeddings, response_b_embeddings):
-        first, second = map(self._normalize, (response_a_embeddings, response_b_embeddings))
-        if first.shape != second.shape or first.shape[1] != self.dimension:
-            raise ValueError("Response vectors have incompatible shapes")
-        return np.stack([self.index.search(values, 1)[0][:, 0] for values in (first, second)], axis=1)
