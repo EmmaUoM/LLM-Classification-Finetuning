@@ -44,7 +44,7 @@ def test_cli_merges_json_then_explicit_overrides(tmp_path):
     cfg = config.parse_args(["--input-root", "/new/input", "--train-csv", "chosen.csv"])
     assert cfg.train_csv == "chosen.csv"
     with pytest.raises(SystemExit):
-        config.parse_args(["--ensemble-weights", "1", "0", "0"])
+        config.parse_args(["--train-backends", "deberta", "--ensemble-weights", "1", "0", "0"])
 
 
 def test_cli_defaults_to_all_folds_and_supports_explicit_single_fold(tmp_path):

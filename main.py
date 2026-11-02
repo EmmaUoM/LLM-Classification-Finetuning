@@ -33,6 +33,9 @@ def main(argv=None):
     write_json(run_dir / "config.json", asdict(cfg))
     LOGGER.info("Run directory: %s", run_dir)
     try:
+        if cfg.mode == "submit" and cfg.offline_wheelhouse and cfg.install_offline_dependencies:
+            from submission_support import install_offline_dependencies
+            install_offline_dependencies(cfg.offline_wheelhouse)
         from pipeline import run_pipeline
         result = run_pipeline(cfg, run_dir=run_dir)
         LOGGER.info("Execution finished: %s", json.dumps(result, default=str))

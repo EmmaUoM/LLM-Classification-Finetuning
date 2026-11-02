@@ -14,9 +14,12 @@ import torch
 
 from config import CLASS_COLUMNS, TEXT_COLUMNS, LOGGER
 from data import clean_dataframe, load_labels, load_sentence_encoder, semantic_features, split_training_data
-from evaluation import classification_metrics, make_submission, weighted_ensemble
+from evaluation import classification_metrics, make_submission, validate_probabilities, weighted_ensemble
 from inference import predict_probabilities
-from models import load_model_bundle
+from models import hf_options, load_model_bundle, sequence_checkpoint_layout
+from submission_support import (find_offline_base, locate_competition_csv, prepare_offline_wheelhouse,
+                                runtime_requirements, save_training_manifest)
+from transformers import AutoConfig, AutoTokenizer
 from tracking import RunTracker, track_stage
 from training import train_backend
 from utils import bundle_manifest, create_run_directory, release_gpu, set_seeds, sha256_file, verify_bundle, write_json
@@ -27,6 +30,52 @@ def text_profile(frame):
                      "p95_characters": float(frame[column].str.len().quantile(0.95)),
                      "empty_fraction": float(frame[column].eq("").mean())}
             for column in TEXT_COLUMNS}
+
+
+def preflight_training_sources(cfg):
+    """Check every requested model before starting the first fine-tuning run."""
+    report, failures = {}, {}
+    if "deberta" in cfg.train_backends and cfg.use_semantic_features:
+        source = Path(cfg.sentence_model)
+        if source.is_absolute() or source.is_dir():
+            if not (source / "modules.json").is_file():
+                raise FileNotFoundError(f"Attach the full SentenceTransformer Input: {source}")
+    for name in cfg.train_backends:
+        source = cfg.model_sources[name]
+        LOGGER.info("Checking %s: %s", name, source)
+        try:
+            options = hf_options(cfg, name)
+            model_config = AutoConfig.from_pretrained(source, **options)
+            accepted = {"deberta", "deberta-v2"} if name == "deberta" else {
+                "gemma2" if name == "gemma" else "llama"}
+            if model_config.model_type not in accepted:
+                raise ValueError(f"Expected {accepted}, got {model_config.model_type}")
+            layout = "standard HF"
+            if name in {"gemma", "llama"} and Path(source).is_dir():
+                _, fused = sequence_checkpoint_layout(source)
+                layout = "LMSYS fused MLP/head" if fused else layout
+            tokenizer = AutoTokenizer.from_pretrained(source, **options)
+            if tokenizer.pad_token_id is None and tokenizer.eos_token_id is None:
+                raise ValueError("Tokenizer has neither a pad nor an EOS token")
+            report[name] = {"source": str(source), "status": "accessible", "layout": layout,
+                            "model_type": model_config.model_type}
+            del tokenizer
+        except Exception as error:
+            failures[name] = f"{type(error).__name__}: {error}"
+            report[name] = {"source": str(source), "status": "failed", "error": failures[name]}
+    write_json(Path(cfg.output_root) / "training_preflight.json", report)
+    if failures:
+        raise RuntimeError(f"Cannot train all requested models. Check Kaggle Inputs or explicit Hub sources: {failures}")
+    cfg.sources_preflight_done = True
+
+
+def prepare_training_assets(cfg):
+    preflight_training_sources(cfg)
+    if cfg.export_offline_dependencies and not cfg.offline_wheelhouse:
+        cfg.offline_wheelhouse = prepare_offline_wheelhouse(
+            runtime_requirements(cfg.train_backends), cfg.output_root)
+    LOGGER.info("Training plan: %s fold(s) x %s models", cfg.n_splits if cfg.cross_validation else 1,
+                len(cfg.train_backends))
 
 
 def train_pipeline(cfg, run_dir, tracker):
@@ -80,8 +129,12 @@ def train_pipeline(cfg, run_dir, tracker):
             release_gpu()
 
     validation_predictions, directories = {}, {}
+    backend_status = {name: "pending" for name in cfg.train_backends}
+    write_json(run_dir / "backend_status.json", backend_status)
     for name in cfg.train_backends:
         with track_stage(f"{name}_finetuning", tracker):
+            backend_status[name] = "running"
+            write_json(run_dir / "backend_status.json", backend_status)
             probabilities, directory = train_backend(
                 name, train, valid, train_features if name == "deberta" else None,
                 valid_features if name == "deberta" else None, cfg, run_dir, tracker)
@@ -98,6 +151,8 @@ def train_pipeline(cfg, run_dir, tracker):
             tracker.artifact(directory / "training_update_audit.json", f"models/{name}")
             if cfg.log_models_to_mlflow:
                 tracker.artifacts(directory, f"model_bundles/{name}")
+            backend_status[name] = "complete"
+            write_json(run_dir / "backend_status.json", backend_status)
 
     with track_stage("validation_ensemble", tracker):
         ensemble, weights = weighted_ensemble(validation_predictions, cfg.ensemble_weights)
@@ -135,6 +190,10 @@ def cross_validation_pipeline(cfg, run_dir):
     write_json(run_dir / "cv_progress.json", progress)
     summary_tracker = RunTracker(cfg, run_dir)
     try:
+        if not torch.cuda.is_available() and not cfg.allow_cpu_training:
+            raise RuntimeError("Enable a GPU in Kaggle, or allow CPU training only for a tiny smoke test.")
+        prepare_training_assets(cfg)
+        save_training_manifest(cfg, cfg.training_group_id, fold_results, "running")
         cleaned, _, _ = clean_dataframe(pd.read_csv(cfg.train_csv, dtype={"id": str}), training=True)
         expected = cleaned.set_index("id")
         seen_ids = set()
@@ -144,7 +203,9 @@ def cross_validation_pipeline(cfg, run_dir):
             fold_dir = run_dir / "folds" / f"fold_{fold}"
             fold_dir.mkdir(parents=True, exist_ok=False)
             # Each call loads fresh pretrained models and closes its own MLflow run.
-            result = run_pipeline(fold_cfg, run_dir=fold_dir)
+            result = run_pipeline(fold_cfg, run_dir=fold_dir, _cv_fold=True)
+            if set(result["model_bundles"]) != set(cfg.train_backends):
+                raise RuntimeError(f"Fold {fold} did not finish all requested models")
             predictions = pd.read_csv(fold_dir / "ensemble_validation_predictions.csv", dtype={"id": str})
             ids = set(predictions.id)
             if predictions.id.duplicated().any() or ids & seen_ids:
@@ -157,6 +218,7 @@ def cross_validation_pipeline(cfg, run_dir):
             predictions["fold"] = fold
             oof_parts.append(predictions)
             fold_results.append({"fold": fold, **result})
+            save_training_manifest(cfg, cfg.training_group_id, fold_results, "running")
             fold_rows.append({"fold": fold, **result["validation_metrics"],
                               "run_directory": str(fold_dir)})
             pd.DataFrame(fold_rows).to_csv(run_dir / "fold_metrics.csv", index=False)
@@ -187,7 +249,11 @@ def cross_validation_pipeline(cfg, run_dir):
             tracker.metrics({f"cv_mean_{key}": value for key, value in summary["fold_metrics_mean"].items()})
             tracker.metrics({f"cv_std_{key}": value for key, value in summary["fold_metrics_std"].items()})
             tracker.metrics({f"oof_{key}": value for key, value in oof_metrics.items()})
-            result = {"fold_results": fold_results, "validation_metrics": oof_metrics,
+            all_bundles = {name: [item["model_bundles"][name] for item in fold_results]
+                           for name in cfg.train_backends}
+            result = {"fold_results": fold_results, "model_bundles": all_bundles,
+                      "training_manifest": str(Path(cfg.output_root) / "training_manifest.json"),
+                      "validation_metrics": oof_metrics,
                       "cv_summary": summary, "run_directory": str(run_dir),
                       "mlflow_run_id": tracker.run_id}
             write_json(run_dir / "result.json", result)
@@ -195,9 +261,11 @@ def cross_validation_pipeline(cfg, run_dir):
                 tracker.artifact(run_dir / name)
         progress["status"] = "FINISHED"
         write_json(run_dir / "cv_progress.json", progress)
+        save_training_manifest(cfg, cfg.training_group_id, fold_results, "complete")
         LOGGER.info("Completed %s folds. OOF metrics: %s", cfg.n_splits, oof_metrics)
         return result
     except BaseException as error:
+        save_training_manifest(cfg, cfg.training_group_id, fold_results, "failed", error)
         progress.update(status="FAILED", exception_type=type(error).__name__, message=str(error))
         write_json(run_dir / "cv_progress.json", progress)
         if not (run_dir / "run_summary.json").exists():
@@ -222,24 +290,38 @@ def submission_pipeline(cfg, run_dir, tracker):
         test[["id"]].to_csv(run_dir / "prediction_row_order.csv", index=False)
         for filename in ("test_quality_report.json", "test_manifest.json", "prediction_row_order.csv"):
             tracker.artifact(run_dir / filename)
-    predictions, drift_reports = {}, {}
-    for name, bundle in cfg.inference_bundles.items():
+    predictions, drift_reports, verified_bases = {}, {}, set()
+    for name, bundles in cfg.inference_bundles.items():
         with track_stage(f"{name}_inference", tracker):
-            verify_bundle(bundle)
-            metadata = json.loads((Path(bundle) / "bundle_config.json").read_text())
-            if metadata["backend"] != name:
-                raise ValueError(f"Wrong backend name for bundle {bundle}")
-            features = None
-            if name == "deberta" and metadata["semantic_feature_mode"] == "paired_cosine":
-                # The sentence encoder travels with the trained custom classifier.
-                encoder = load_sentence_encoder(Path(bundle) / "semantic_encoder", cfg)
-                encoder.max_seq_length = metadata["sentence_max_length"]
-                features = semantic_features(test, encoder, cfg.sentence_batch_size)
-                del encoder
+            fold_predictions, fold_reports = [], []
+            for fold, bundle in enumerate(bundles):
+                verify_bundle(bundle)
+                metadata = json.loads((Path(bundle) / "bundle_config.json").read_text())
+                if metadata["backend"] != name:
+                    raise ValueError(f"Wrong backend name for bundle {bundle}")
+                if name != "deberta":
+                    base = find_offline_base(bundle, metadata, name, cfg.base_model_overrides,
+                                             cfg.auto_discover_roots)
+                    if base not in verified_bases and (Path(base) / "manifest.json").is_file():
+                        verify_bundle(base)
+                        verified_bases.add(base)
+                features = None
+                if name == "deberta" and metadata["semantic_feature_mode"] == "paired_cosine":
+                    encoder = load_sentence_encoder(Path(bundle) / "semantic_encoder", cfg)
+                    encoder.max_seq_length = metadata["sentence_max_length"]
+                    features = semantic_features(test, encoder, cfg.sentence_batch_size)
+                    del encoder
+                    release_gpu()
+                model, tokenizer, metadata = load_model_bundle(bundle, cfg, name=name, verify=False)
+                values = predict_probabilities(model, tokenizer, test, features, name,
+                                               metadata["max_length"], cfg)
+                fold_predictions.append(values)
+                fold_reports.append({"bundle": str(bundle),
+                                     "training_text_profile": metadata.get("training_text_profile")})
+                np.save(run_dir / f"prob_{name}_fold_{fold}.npy", values)
+                del model, tokenizer, features
                 release_gpu()
-            model, tokenizer, metadata = load_model_bundle(bundle, cfg, name=name, verify=False)
-            values = predict_probabilities(model, tokenizer, test, features, name,
-                                           metadata["max_length"], cfg)
+            values = validate_probabilities(np.mean(fold_predictions, axis=0), len(test))
             predictions[name] = values
             if labels is not None:
                 tracker.metrics({f"{name}_evaluation_{key}": value for key, value in classification_metrics(labels, values).items()})
@@ -248,11 +330,9 @@ def submission_pipeline(cfg, run_dir, tracker):
                              f"{name}_mean_entropy": -(values * np.log(np.clip(values, 1e-15, 1))).sum(axis=1).mean(),
                              **{f"{name}_predicted_fraction_{key}": float(np.mean(values.argmax(axis=1) == i))
                                 for i, key in enumerate(CLASS_COLUMNS)}})
-            drift_reports[name] = {"training_text_profile": metadata.get("training_text_profile"),
+            drift_reports[name] = {"folds": fold_reports,
                                    "test_text_profile": text_profile(test),
                                    "note": "Descriptive input monitoring; no test labels or accuracy are inferred."}
-            del model, tokenizer, features
-            release_gpu()
     with track_stage("submission_export", tracker):
         ensemble, weights = weighted_ensemble(predictions, cfg.ensemble_weights)
         if labels is not None:
@@ -277,24 +357,46 @@ def submission_pipeline(cfg, run_dir, tracker):
     return {"submission": str(destination), "rows": len(test)}
 
 
-def run_pipeline(cfg, run_dir=None):
+def run_pipeline(cfg, run_dir=None, *, _cv_fold=False):
     cfg.validate()
     run_dir = create_run_directory(cfg) if run_dir is None else Path(run_dir)
     LOGGER.info("Run directory: %s", run_dir)
+    owns_manifest = cfg.mode == "train" and not _cv_fold
+    if owns_manifest:
+        cfg.training_group_id = run_dir.name
+        save_training_manifest(cfg, cfg.training_group_id, [], "running")
+        try:
+            cfg.train_csv = locate_competition_csv("train.csv", cfg.train_csv)
+        except BaseException as error:
+            save_training_manifest(cfg, cfg.training_group_id, [], "failed", error)
+            raise
+    elif cfg.mode == "submit":
+        cfg.test_csv = locate_competition_csv("test.csv", cfg.test_csv)
     if cfg.mode == "train" and cfg.cross_validation:
         return cross_validation_pipeline(cfg, run_dir)
-    with RunTracker(cfg, run_dir) as tracker:
-        with track_stage("preflight", tracker):
-            set_seeds(cfg.seed)
-            if cfg.mode == "train" and not torch.cuda.is_available() and not cfg.allow_cpu_training:
-                raise RuntimeError("Enable a GPU in Kaggle, or set allow_cpu_training=True only for a tiny smoke test.")
-            if cfg.mode == "submit" and not cfg.local_files_only:
-                raise AssertionError("Submission mode must load models offline")
-        if cfg.mode == "train":
-            result = train_pipeline(cfg, run_dir, tracker)
-        else:
-            result = submission_pipeline(cfg, run_dir, tracker)
-        result.update(run_directory=str(run_dir), mlflow_run_id=tracker.run_id)
-        write_json(run_dir / "result.json", result)
-        tracker.artifact(run_dir / "result.json")
+    try:
+        with RunTracker(cfg, run_dir) as tracker:
+            with track_stage("preflight", tracker):
+                set_seeds(cfg.seed)
+                if cfg.mode == "train" and not torch.cuda.is_available() and not cfg.allow_cpu_training:
+                    raise RuntimeError("Enable a GPU in Kaggle, or set allow_cpu_training=True only for a tiny smoke test.")
+                if cfg.mode == "submit" and not cfg.local_files_only:
+                    raise AssertionError("Submission mode must load models offline")
+                if owns_manifest:
+                    prepare_training_assets(cfg)
+                    save_training_manifest(cfg, cfg.training_group_id, [], "running")
+            if cfg.mode == "train":
+                result = train_pipeline(cfg, run_dir, tracker)
+            else:
+                result = submission_pipeline(cfg, run_dir, tracker)
+            result.update(run_directory=str(run_dir), mlflow_run_id=tracker.run_id)
+            if owns_manifest:
+                manifest = save_training_manifest(cfg, cfg.training_group_id, [result], "complete")
+                result["training_manifest"] = str(manifest)
+            write_json(run_dir / "result.json", result)
+            tracker.artifact(run_dir / "result.json")
+    except BaseException as error:
+        if owns_manifest:
+            save_training_manifest(cfg, cfg.training_group_id, [], "failed", error)
+        raise
     return result

@@ -11,12 +11,13 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import confusion_matrix
 from transformers import get_linear_schedule_with_warmup
+from tqdm.auto import tqdm
 
 from config import CLASS_COLUMNS, LOGGER
 from data import PreferenceDataset, make_loader
 from evaluation import classification_metrics
 from inference import autocast_context, move_batch, predict_probabilities
-from models import load_training_model, model_logits, save_model_bundle
+from models import export_quantized_base, load_training_model, model_logits, save_model_bundle
 from utils import release_gpu, set_seeds, write_json
 
 
@@ -118,7 +119,7 @@ def train_backend(name, train, valid, train_features, valid_features, cfg, run_d
         optimizer.zero_grad(set_to_none=True)
         loss_sum, seen = 0.0, 0
         epoch_started = time.perf_counter()
-        for batch_index, batch in enumerate(loader):
+        for batch_index, batch in enumerate(tqdm(loader, desc=f"{name} epoch {epoch + 1}/{cfg.epochs}")):
             batch = move_batch(batch, device)
             with autocast_context(cfg):
                 logits = model_logits(model, batch, name)
@@ -201,11 +202,13 @@ def train_backend(name, train, valid, train_features, valid_features, cfg, run_d
         "Validation is grouped by the complete normalized question, after label QA and pair deduplication. "
         "It is a development set used for model selection. Scores are not a Kaggle test result.\n\n"
         "Base model training data must be audited separately; using a competition-finetuned base "
-        "may contaminate this validation set. This notebook defaults to general pretrained bases.\n",
+        "may contaminate this validation set. The default Kaggle Gemma/Llama checkpoints "
+        "have already been fine-tuned on this competition task.\n",
         encoding="utf-8",
     )
     tracker.params({f"{name}_best_epoch": best_epoch})
     tracker.metrics({f"{name}_best_validation_{key}": value for key, value in final_metrics.items()})
+    export_quantized_base(model, tokenizer, name, cfg, model_directory)
     del model, optimizer, scheduler, scaler, loader, dataset
     release_gpu()
     return best_probabilities, model_directory

@@ -3,6 +3,7 @@
 from __future__ import annotations
 import json
 import pickle
+import os
 from pathlib import Path
 
 import torch
@@ -11,7 +12,97 @@ from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassificati
 from safetensors.torch import save_file as save_safetensors, load_file as load_safetensors
 
 from config import CLASS_COLUMNS, ARCHITECTURE_VERSION
-from utils import verify_bundle, write_json
+from config import LOGGER
+from submission_support import find_offline_base
+from transformers import Gemma2ForSequenceClassification, LlamaForSequenceClassification
+from transformers.activations import ACT2FN
+from utils import bundle_manifest, verify_bundle, write_json
+
+
+class KaggleFusedMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden, intermediate = config.hidden_size, config.intermediate_size
+        bias = bool(getattr(config, "mlp_bias", False))
+        self.gate_up_proj = nn.Linear(hidden, 2 * intermediate, bias=bias)
+        self.down_proj = nn.Linear(intermediate, hidden, bias=bias)
+        activation = getattr(config, "hidden_activation", None) or config.hidden_act
+        self.act_fn = ACT2FN[activation]
+
+    def forward(self, values):
+        gate, up = self.gate_up_proj(values).chunk(2, dim=-1)
+        return self.down_proj(self.act_fn(gate) * up)
+
+
+def install_kaggle_checkpoint_layers(model, config):
+    for layer in model.model.layers:
+        layer.mlp = KaggleFusedMLP(config)
+    model.score = nn.Sequential(
+        nn.Dropout(0.1),
+        nn.Linear(config.hidden_size, config.hidden_size // 2),
+        nn.Dropout(0.1), nn.GELU(),
+        nn.Linear(config.hidden_size // 2, config.num_labels),
+    )
+    # This marker survives save_pretrained(), including the shared 4-bit base.
+    model.config.lmsys_fused_checkpoint = True
+    model.post_init()
+
+
+class KaggleGemmaForSequenceClassification(Gemma2ForSequenceClassification):
+    def __init__(self, config):
+        super().__init__(config)
+        install_kaggle_checkpoint_layers(self, config)
+
+
+class KaggleLlamaForSequenceClassification(LlamaForSequenceClassification):
+    def __init__(self, config):
+        super().__init__(config)
+        install_kaggle_checkpoint_layers(self, config)
+
+
+def sequence_checkpoint_layout(source):
+    directory = Path(source)
+    if not directory.is_dir():
+        raise FileNotFoundError(
+            f"Attach the Kaggle model Input and copy its mounted directory: {directory}")
+    config = AutoConfig.from_pretrained(
+        str(directory), local_files_only=True, trust_remote_code=False)
+    if config.model_type not in {"gemma2", "llama"}:
+        raise ValueError(f"Expected Gemma 2 or Llama checkpoint: {directory}")
+    if (directory / "adapter_config.json").is_file():
+        raise ValueError(f"Choose a full model checkpoint, not a LoRA adapter: {directory}")
+    index = directory / "model.safetensors.index.json"
+    keys = set(json.loads(index.read_text())["weight_map"]) if index.is_file() else set()
+    fused = bool(getattr(config, "lmsys_fused_checkpoint", False)) or any(
+        ".mlp.gate_up_proj." in key for key in keys)
+    if not keys and not (directory / "model.safetensors").is_file() and not (
+            directory / "pytorch_model.bin").is_file() and not (
+            directory / "pytorch_model.bin.index.json").is_file():
+        raise FileNotFoundError(f"No model weights found in {directory}")
+    return config, fused
+
+
+def load_sequence_checkpoint(source, **kwargs):
+    # Explicit Hub sources remain supported; the default Kaggle sources are local.
+    if not Path(source).is_dir() and not Path(source).is_absolute() and not str(source).startswith("."):
+        return AutoModelForSequenceClassification.from_pretrained(source, **kwargs)
+    config, fused = sequence_checkpoint_layout(source)
+    model_class = AutoModelForSequenceClassification
+    if fused:
+        model_class = {"gemma2": KaggleGemmaForSequenceClassification,
+                       "llama": KaggleLlamaForSequenceClassification}[config.model_type]
+    kwargs["local_files_only"] = True
+    kwargs["trust_remote_code"] = False
+    model, info = model_class.from_pretrained(
+        str(source), output_loading_info=True, **kwargs)
+    if fused:
+        failures = {key: info.get(key) for key in (
+            "missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs") if info.get(key)}
+        if failures:
+            raise RuntimeError(f"Kaggle checkpoint did not load completely: {failures}")
+    LOGGER.info("Loaded %s: %s", config.model_type,
+                "LMSYS fused MLP/head" if fused else "standard HF layout")
+    return model
 
 
 class CustomDebertaModel(nn.Module):
@@ -37,7 +128,8 @@ class CustomDebertaModel(nn.Module):
 
 
 def hf_options(cfg, name):
-    options = {"local_files_only": cfg.local_files_only, "trust_remote_code": False}
+    options = {"local_files_only": bool(cfg.local_files_only or Path(cfg.model_sources[name]).is_dir()),
+               "trust_remote_code": False}
     if cfg.model_revisions.get(name):
         options["revision"] = cfg.model_revisions[name]
     return options
@@ -64,9 +156,10 @@ def load_training_model(name, cfg):
             raise RuntimeError("Gemma/Llama QLoRA requires an NVIDIA CUDA GPU")
         from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
         quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                         llm_int8_skip_modules=["score"],
                                          bnb_4bit_use_double_quant=True,
                                          bnb_4bit_compute_dtype=torch.float16)
-        model = AutoModelForSequenceClassification.from_pretrained(
+        model = load_sequence_checkpoint(
             source, num_labels=3, problem_type="single_label_classification", use_cache=False,
             quantization_config=quantization, torch_dtype=torch.float16,
             device_map={"": 0}, attn_implementation="eager", **options,
@@ -132,21 +225,57 @@ def load_model_bundle(directory, cfg, name=None, verify=True):
         if not torch.cuda.is_available():
             raise RuntimeError("Quantized Gemma/Llama inference requires a CUDA GPU")
         from peft import PeftModel
-        source = cfg.base_model_overrides.get(saved_name, metadata["base_model_source"])
+        source = find_offline_base(directory, metadata, saved_name,
+                                   cfg.base_model_overrides, cfg.auto_discover_roots)
         kwargs = {"local_files_only": cfg.local_files_only, "trust_remote_code": False}
-        if metadata.get("base_revision") and saved_name not in cfg.base_model_overrides:
+        if metadata.get("base_revision") and not Path(source).is_dir():
             kwargs["revision"] = metadata["base_revision"]
         quantization = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                         llm_int8_skip_modules=["score"],
                                          bnb_4bit_use_double_quant=True,
                                          bnb_4bit_compute_dtype=torch.float16)
-        base = AutoModelForSequenceClassification.from_pretrained(
-            source, num_labels=3, use_cache=False, quantization_config=quantization,
-            torch_dtype=torch.float16, device_map={"": 0}, attn_implementation="eager", **kwargs,
+        base_config = AutoConfig.from_pretrained(source, **kwargs)
+        # Saved 4-bit bases already carry their quantization config and packed weights.
+        quantization_options = {} if getattr(base_config, "quantization_config", None) else {
+            "quantization_config": quantization}
+        base = load_sequence_checkpoint(
+            source, num_labels=3, use_cache=False,
+            torch_dtype=torch.float16, device_map={"": 0}, attn_implementation="eager",
+            **quantization_options, **kwargs,
         )
         base.config.pad_token_id = tokenizer.pad_token_id
         model = PeftModel.from_pretrained(base, str(directory), is_trainable=False,
                                           local_files_only=True)
     return model.eval(), tokenizer, metadata
+
+
+def export_quantized_base(model, tokenizer, name, cfg, bundle_directory):
+    """Save one frozen 4-bit base per training group; adapters remain separate per fold.
+
+    Called only AFTER the selected adapter/head and all training audits are saved.
+    unload() removes adapters without merging, so no fold's LoRA is applied twice.
+    """
+    if name == "deberta" or not cfg.export_quantized_bases:
+        return
+    directory = (Path(cfg.output_root) / "submission_assets" / "base_models"
+                 / cfg.training_group_id / name)
+    marker = directory / "offline_base.json"
+    if not (marker.is_file() and (directory / "manifest.json").is_file()):
+        LOGGER.info("Exporting shared %s 4-bit base for offline submission", name)
+        directory.mkdir(parents=True, exist_ok=True)
+        base = model.base_model.unload()
+        base.config.use_cache = False
+        base.save_pretrained(str(directory), safe_serialization=True, max_shard_size="2GB")
+        tokenizer.save_pretrained(str(directory))
+        write_json(marker, {"backend": name, "base_model_source": cfg.model_sources[name],
+                           "training_group_id": cfg.training_group_id, "lora_merged": False})
+        bundle_manifest(directory)
+        del base
+    metadata_path = Path(bundle_directory) / "bundle_config.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["offline_base_relative"] = os.path.relpath(directory, bundle_directory)
+    metadata["training_group_id"] = cfg.training_group_id
+    write_json(metadata_path, metadata)
 
 
 class LegacyCustomDebertaModel(nn.Module):

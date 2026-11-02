@@ -149,7 +149,7 @@ def trained_project(tmp_path_factory, tokenizer):
     sentence_encoder.save_pretrained(str(sentence_path))
     train_path = directory / 'train.csv'
     pd.DataFrame([example(i) for i in range(61)]).to_csv(train_path, index=False)
-    cfg = config.Config(cross_validation=False, train_csv=str(train_path), output_root=str(directory / 'output'), epochs=2, patience=3, deberta_batch_size=5, grad_accum_steps=3, eval_batch_size=6, deberta_max_length=64, sentence_max_length=32, sentence_model=str(sentence_path), model_sources={'deberta': str(source)}, allow_cpu_training=True, local_files_only=True, use_amp=False, enable_mlflow=False, encoder_lr=0.001, head_lr=0.001, source_snapshot=str(ROOT))
+    cfg = config.Config(cross_validation=False, train_backends=('deberta',), export_offline_dependencies=False, train_csv=str(train_path), output_root=str(directory / 'output'), epochs=2, patience=3, deberta_batch_size=5, grad_accum_steps=3, eval_batch_size=6, deberta_max_length=64, sentence_max_length=32, sentence_model=str(sentence_path), model_sources={'deberta': str(source)}, allow_cpu_training=True, local_files_only=True, use_amp=False, enable_mlflow=False, encoder_lr=0.001, head_lr=0.001, source_snapshot=str(ROOT))
     result = pipeline.run_pipeline(cfg)
     return (directory, cfg, result)
 
@@ -218,8 +218,8 @@ def test_complete_five_fold_training_and_oof_metrics(trained_project, monkeypatc
 def test_cv_rejects_incomplete_or_invalid_results(tmp_path, monkeypatch, problem):
     path = tmp_path / 'train.csv'
     pd.DataFrame([example(i) for i in range(90)]).to_csv(path, index=False)
-    cfg = config.Config(train_csv=str(path), output_root=str(tmp_path),
-                        allow_cpu_training=True, enable_mlflow=False, use_semantic_features=False)
+    cfg = config.Config(train_csv=str(path), output_root=str(tmp_path), train_backends=('deberta',),
+                        export_offline_dependencies=False, allow_cpu_training=True, enable_mlflow=False, use_semantic_features=False)
 
     def fake_train(settings, run_dir, tracker):
         if problem == 'failure' and settings.holdout_fold == 2:
@@ -238,9 +238,10 @@ def test_cv_rejects_incomplete_or_invalid_results(tmp_path, monkeypatch, problem
             elif problem == 'wrong_label':
                 out.loc[0, 'true_label'] = (out.loc[0, 'true_label'] + 1) % 3
         out.to_csv(run_dir / 'ensemble_validation_predictions.csv', index=False)
-        return {'model_bundles': {}, 'validation_metrics': metrics}
+        return {'model_bundles': {'deberta': str(run_dir / 'models' / 'deberta')}, 'validation_metrics': metrics}
 
     monkeypatch.setattr(pipeline, 'train_pipeline', fake_train)
+    monkeypatch.setattr(pipeline, 'preflight_training_sources', lambda cfg: None)
     error_type = RuntimeError if problem == 'failure' else ValueError
     with pytest.raises(error_type):
         pipeline.run_pipeline(cfg)

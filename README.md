@@ -1,13 +1,16 @@
 # LLM Preference Classification with Fine-tuning and MLflow
 
 Predict whether a human prefers response A, response B, or a tie for the same prompt.
-This project is the modular Python version of the updated `finetuning-emma.ipynb`.
+This project is the modular Python version of the updated three-model Kaggle notebook.
 It includes real fine-tuning on the competition training set, data cleaning,
 complete grouped five-fold development cross-validation, model bundles, and separate offline inference.
 
-The default trains the custom DeBERTa branch. Gemma 2 and Llama 3 can also be
-fine-tuned sequentially using 4-bit NF4 weights, LoRA adapters, and a trainable
-classification head. General pretrained models are the default starting points.
+The default trains **DeBERTa, Gemma 2, and Llama 3 sequentially in every fold**.
+Gemma/Llama initialize from the same local Kaggle checkpoints used by the reference
+notebook, using 4-bit NF4 weights, LoRA adapters, and a trainable classification head.
+A complete training manifest connects all folds to separate offline submission.
+These Gemma/Llama checkpoints have already been fine-tuned on the competition task;
+local development scores may therefore contain overlap with their original training data.
 
 ## Files
 
@@ -18,16 +21,17 @@ Keep the Python modules together in the repository root.
 | `main.py` | Command-line entry point, run directories, logs, and failure handling |
 | `config.py` | Arguments, shared class order, configuration, and logger |
 | `data.py` | CSV validation and cleaning, grouped splits, A/B-swapped inputs, real labels, paired semantic features, and optional FAISS features |
-| `models.py` | Custom DeBERTa architecture, QLoRA factories, model bundles, and legacy checkpoint loading |
+| `models.py` | Custom DeBERTa, Kaggle fused-checkpoint compatibility, QLoRA factories, shared 4-bit bases, model bundles, and legacy loading |
 | `inference.py` | Gemma 2, Llama 3, and custom classifier inference with A/B restoration |
 | `evaluation.py` | Probability checks, weighted ensemble, and evaluation metrics |
 | `tracking.py` | MLflow parameters, metrics, artifacts, failure records, and runtime/GPU monitoring |
 | `utils.py` | Seeds, hashes, source snapshots, environment snapshots, manifests, and JSON |
-| `pipeline.py` | Execution of all pipeline stages |
+| `pipeline.py` | Preflight checks, execution, complete-fold manifests, OOF statistics, and multi-fold submission |
+| `submission_support.py` | Portable training manifests, Kaggle Input discovery, offline base resolution, and dependency wheels |
 | `training.py` | Actual gradient updates, validation, early stopping, best checkpoints, and parameter-update audits |
 | `requirements-mlops.txt` | Additional MLflow dependencies |
-| `requirements.txt` | Full default DeBERTa runtime, including MLOps dependencies |
-| `requirements-qlora.txt` | Optional Gemma/Llama QLoRA runtime |
+| `requirements.txt` | DeBERTa and tracking runtime |
+| `requirements-qlora.txt` | Default three-model runtime, including Gemma/Llama QLoRA |
 | `requirements-faiss.txt` | Optional FAISS retrieval-feature dependencies |
 | `requirements-dev.txt` | Test dependencies |
 | `configs/` | Training and inference JSON configuration examples |
@@ -36,27 +40,50 @@ Keep the Python modules together in the repository root.
 ## Environment
 
 Python 3.10 or newer is required. Keep the CUDA-enabled PyTorch build supplied
-by Kaggle or your GPU environment, then install:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-For optional Gemma/Llama QLoRA:
+by Kaggle or your GPU environment, then install the three-model runtime:
 
 ```bash
 python -m pip install -r requirements-qlora.txt
 ```
 
+A DeBERTa-only run needs `requirements.txt` and `--train-backends deberta`.
+The dependency overlay matches the notebook: Transformers 4.46.3, safetensors 0.8.0,
+MLflow skinny 2.22.2, and PyArrow 23.0.1. Keep Kaggle's existing CUDA/PyTorch build.
+
 QLoRA requires an NVIDIA CUDA GPU and compatible bitsandbytes binaries. The
 notebook's old Python-3.10-specific Triton/xformers wheels are no longer required.
-One model is loaded on `cuda:0` at a time; the old two-GPU custom inference modules
-are not used by the new training pipeline.
+One model is loaded on `cuda:0` at a time. The loader preserves the original Kaggle
+checkpoints' fused `gate_up_proj` and multi-layer `score` head using standard
+Transformers attention. Missing or unexpected weights in this layout are errors,
+so a path change cannot silently leave part of the model randomly initialized.
 
 Hugging Face models may be downloaded during training, or provided as local
 standard Hugging Face directories with `--local-files-only`. Gemma/Llama access
 may require accepting the model license and authenticating through your existing
 Hugging Face login or environment. Never put access tokens in committed files.
+
+## Kaggle checkpoint Inputs
+
+Add the following Inputs in the Kaggle notebook before running this project:
+
+| Model or asset | Source / legacy mounted directory |
+| --- | --- |
+| Gemma 2 | [tascj0/lmsys-checkpoints-0-0805](https://www.kaggle.com/datasets/tascj0/lmsys-checkpoints-0-0805), `/kaggle/input/lmsys-checkpoints-0-0805` |
+| Llama 3 | [tascj0/lmsys-checkpoints-3-0805](https://www.kaggle.com/datasets/tascj0/lmsys-checkpoints-3-0805), `/kaggle/input/lmsys-checkpoints-3-0805` |
+| Sentence Transformer | Reference notebook's `some-pack`, containing `sentence-transformer-model/modules.json` |
+| Competition CSVs | LLM Classification Finetuning competition Input |
+
+Both legacy mounts and `/kaggle/input/datasets/<owner>/<slug>` are recognized.
+Gemma/Llama read these complete local checkpoints without a Hugging Face login.
+DeBERTa retains the current paired-feature architecture and defaults to
+`microsoft/deberta-v3-base`; provide a standard local backbone with
+`--model-source deberta=...` to avoid downloading it. The reference notebook's old
+`custom_model_complete.pth` has a different architecture and is not used by this
+training pipeline.
+
+The reference source is [blue0924/finetuning-test2](https://www.kaggle.com/code/blue0924/finetuning-test2).
+Local model loading does not install Python packages. Initial dependency installation
+and the default export of offline wheels still require Internet access.
 
 ## Train
 
@@ -82,20 +109,22 @@ Start with a smaller end-to-end run before a complete training job:
 python main.py --mode train \
     --input-root /kaggle/input \
     --output-dir /kaggle/working \
-    --single-fold --max-train-rows 1000 --max-val-rows 300 --epochs 1
+    --single-fold --max-train-rows 1000 --max-val-rows 300 --epochs 1 \
+    --no-export-offline-dependencies
 ```
 
-Use local pretrained models when Internet is unavailable:
+For an intentionally DeBERTa-only run with locally supplied models:
 
 ```bash
 python main.py --mode train \
     --input-root /kaggle/input --output-dir /kaggle/working \
+    --train-backends deberta --no-export-offline-dependencies \
     --model-source deberta=/kaggle/input/my-deberta-base \
     --sentence-model /kaggle/input/my-sentence-transformer \
     --local-files-only
 ```
 
-Train all three branches after installing the optional QLoRA runtime:
+All three branches are enabled by default; this is the equivalent explicit command:
 
 ```bash
 python main.py --mode train --input-root /kaggle/input \
@@ -104,9 +133,10 @@ python main.py --mode train --input-root /kaggle/input \
 
 Change individual model directories or pin Hub revisions with repeated
 `--model-source BACKEND=VALUE` and `--model-revision BACKEND=COMMIT_HASH` arguments.
-Models initialize from public DeBERTa-v3-base, Gemma-2-9b-it, and
-Meta-Llama-3-8B-Instruct by default. Old custom inference checkpoints are not
-assumed to be standard Hugging Face bases.
+DeBERTa initializes from its standard pretrained backbone, while Gemma/Llama use
+the local Kaggle sources above. Explicit standard Hub sources are also supported
+through `--model-source`; gated Hub models require access to that repository.
+The loader distinguishes standard model layouts from the Kaggle fused layout.
 
 Use `python main.py --help` for CLI options. A JSON configuration can set any
 `Config` field; explicit CLI values override it.
@@ -191,6 +221,10 @@ the cleaned source order, with one prediction per validated ID and a `fold` colu
 The summary records validation coverage and whether row limits were enabled;
 sampled debugging runs are not presented as full-data validation.
 `cv_progress.json` retains completed fold IDs if training fails partway through.
+`training_preflight.json` records source accessibility before the first model trains.
+Each fold's `backend_status.json` records each requested model's progress.
+`<output-dir>/training_manifest.json` is marked `complete` only when every requested
+model and fold has finished. A failed or interrupted group is not auto-submitted.
 
 Each fold directory (or a `--single-fold` run directory) contains:
 
@@ -212,25 +246,51 @@ runs/<run_id>/
 
 The custom bundle contains backbone configuration, fine-tuned safetensors,
 tokenizer, and its sentence encoder when enabled. Gemma/Llama bundles contain
-LoRA adapters and the trained classifier head; attach the matching base weights
-separately for offline inference. Bundles produced by the updated notebook use
-the same architecture version and can be loaded here.
+LoRA adapters and the trained classifier head. Training also exports one shared
+4-bit base per Gemma/Llama model under `submission_assets/base_models/<group>/`,
+without merging any fold's LoRA. Adapters refer to these bases using relative paths.
+The exported base retains the layout marker needed to reload its fused MLP/head.
+Dependency wheels are saved under `submission_assets/wheels/` for the same Python
+major/minor version. `--no-export-quantized-bases` and
+`--no-export-offline-dependencies` opt out of these exports.
+Bundles and complete manifests produced by the updated notebook are supported.
 
-Training mode does not export a competition submission. In a separate inference
-run, supply a saved bundle and the current test data:
+Training mode does not export a competition submission. After training finishes,
+change only the mode while keeping the same configuration:
 
 ```bash
-python main.py --mode submit \
-    --input-root /kaggle/input --output-dir /kaggle/working \
-    --bundle deberta=/kaggle/input/my-trained-models/runs/TRAIN_RUN_ID/folds/fold_0/models/deberta
+python main.py --config configs/train.json --mode submit
 ```
 
-Or edit the placeholder path in `configs/submit.example.json` and pass `--config`.
-The command above loads one fold's model. Each fold writes its own
-`inference_config_example.json`, and the CV `result.json` lists all `fold_results`.
-The current `--bundle` option accepts one directory per backend; it does not
-automatically average all five fold models.
-For Gemma/Llama, also repeat `--base-model BACKEND=LOCAL_BASE_DIRECTORY` as needed.
+Auto-discovery reads the complete manifest under the output directory or attached
+Kaggle Inputs. For a new Kaggle session, save the training version's output, attach
+it as Input with its `training_manifest.json`, `runs/`, and `submission_assets/`
+directories intact, and run:
+
+```bash
+python main.py --config configs/submit.example.json
+```
+
+Each model's saved folds are predicted separately, averaged with equal fold weights,
+then combined using the configured model weights. A three-model training group is
+not automatically reduced to DeBERTa if another model or fold is missing.
+The entry point installs saved dependency wheels offline before importing the ML
+stack; use `--no-install-offline-dependencies` when dependencies are already managed.
+The wheelhouse records the required Python major/minor version.
+
+Explicitly select saved folds when needed. Repeat `--bundle` for multiple folds of
+the same backend; a single explicit model remains supported:
+
+```bash
+python main.py --mode submit --output-dir /kaggle/working \
+    --bundle deberta=/kaggle/input/my-trained-models/runs/RUN/folds/fold_0/models/deberta \
+    --bundle deberta=/kaggle/input/my-trained-models/runs/RUN/folds/fold_1/models/deberta
+```
+
+JSON `inference_bundles` values can be either one path or a list of fold paths.
+These directories must be this pipeline's saved bundles, not raw Kaggle checkpoint
+Inputs. For older adapter-only outputs, repeat `--base-model BACKEND=LOCAL_BASE`.
+Use `--discover-root DIRECTORY` for training outputs outside the standard roots.
 Submission mode forces offline model loading and never reads `train.csv`.
 
 Both A/B orders are evaluated by default, restored to the original class order,

@@ -8,6 +8,8 @@ import math
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from submission_support import kaggle_input_path, normalize_bundles, resolve_submission_plan
+
 LOGGER = logging.getLogger("llm_classification_finetuning")
 CLASS_COLUMNS = ["winner_model_a", "winner_model_b", "winner_tie"]
 TEXT_COLUMNS = ["prompt", "response_a", "response_b"]
@@ -22,14 +24,14 @@ class Config:
     test_csv: str = "/kaggle/input/llm-classification-finetuning/test.csv"
     output_root: str = "./output"
     seed: int = 42
-    train_backends: tuple = ("deberta",)         # optionally add "gemma", "llama"
+    train_backends: tuple = ("deberta", "gemma", "llama")
     model_sources: dict = field(default_factory=lambda: {
         "deberta": "microsoft/deberta-v3-base",
-        "gemma": "google/gemma-2-9b-it",
-        "llama": "meta-llama/Meta-Llama-3-8B-Instruct",
+        "gemma": kaggle_input_path("lmsys-checkpoints-0-0805"),
+        "llama": kaggle_input_path("lmsys-checkpoints-3-0805"),
     })
     model_revisions: dict = field(default_factory=dict)  # HF commit hashes if available
-    inference_bundles: dict = field(default_factory=dict) # name -> saved bundle directory
+    inference_bundles: dict = field(default_factory=dict) # name -> one or more saved fold directories
     base_model_overrides: dict = field(default_factory=dict) # local QLoRA base for submit
     local_files_only: bool = False             # forced True in submit mode
     n_splits: int = 5                           # train every grouped fold by default
@@ -57,7 +59,8 @@ class Config:
     swap_augmentation_probability: float = 0.5 # training only; labels and features swap too
     tta: bool = True                            # average both orders after class restoration
     use_semantic_features: bool = True
-    sentence_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    sentence_model: str = field(default_factory=lambda: kaggle_input_path(
+        "some-pack", "sentence-transformer-model"))
     sentence_revision: str | None = None
     sentence_max_length: int = 256
     sentence_batch_size: int = 64
@@ -70,21 +73,39 @@ class Config:
     })
     enable_mlflow: bool = True
     experiment_name: str = "Emma-LLM-Preference-Finetuning"
-    log_models_to_mlflow: bool = True
+    log_models_to_mlflow: bool = False
     allow_cpu_training: bool = False
     source_snapshot: str | None = None
     labels_csv: str | None = None
     run_name: str | None = None
+    training_group_id: str | None = None
+    offline_wheelhouse: str | None = None
+    export_quantized_bases: bool = True
+    export_offline_dependencies: bool = True
+    install_offline_dependencies: bool = True
+    sources_preflight_done: bool = False
+    auto_discover_roots: tuple = ("/kaggle/working", "/kaggle/input")
 
     def validate(self):
         if self.mode not in {"train", "submit"}:
             raise ValueError("mode must be 'train' or 'submit'")
         if not 0 <= self.seed < 2**32:
             raise ValueError("seed must be in [0, 2**32)")
+        if not isinstance(self.inference_bundles, dict):
+            raise ValueError("inference_bundles must map backend names to saved fold directories")
         if self.mode == "submit":
             self.local_files_only = True
             if not self.inference_bundles:
-                raise ValueError("Set inference_bundles to your saved model directories first.")
+                plan = resolve_submission_plan(
+                    {}, self.train_backends, (self.output_root, *self.auto_discover_roots))
+                self.inference_bundles = plan["bundles"]
+                self.base_model_overrides = {**plan["base_models"], **self.base_model_overrides}
+                self.offline_wheelhouse = self.offline_wheelhouse or plan["wheelhouse"]
+                if plan["ensemble_weights"]:
+                    self.ensemble_weights = plan["ensemble_weights"]
+            # Explicit manual bundles retain the CLI's intentionally selected-model workflow.
+            self.inference_bundles = normalize_bundles(
+                self.inference_bundles, tuple(self.inference_bundles))
         if not self.train_backends or len(set(self.train_backends)) != len(self.train_backends):
             raise ValueError("train_backends must be nonempty and unique")
         if set(self.train_backends) - {"deberta", "gemma", "llama"}:
@@ -125,13 +146,16 @@ class Config:
                 raise ValueError(f"{key} must be None or at least 3")
 
 
-def _named_values(items, flag):
+def _named_values(items, flag, multiple=False):
     result = {}
     for item in items:
         name, separator, value = item.partition("=")
         if not separator or name not in {"deberta", "gemma", "llama"} or not value:
             raise ValueError(f"{flag} expects BACKEND=VALUE, where BACKEND is deberta, gemma, or llama")
-        result[name] = value
+        if multiple:
+            result.setdefault(name, []).append(value)
+        else:
+            result[name] = value
     return result
 
 
@@ -151,13 +175,15 @@ def parse_args(argv=None):
     parser.add_argument("--train-backends", nargs="+", choices=["deberta", "gemma", "llama"])
     parser.add_argument("--model-source", action="append", help="Repeat BACKEND=HF_ID_OR_DIRECTORY")
     parser.add_argument("--model-revision", action="append", help="Repeat BACKEND=HF_COMMIT_HASH")
-    parser.add_argument("--bundle", action="append", help="Repeat BACKEND=SAVED_BUNDLE_DIRECTORY")
+    parser.add_argument("--bundle", action="append", help="Repeat BACKEND=SAVED_FOLD_DIRECTORY, including multiple folds of one model")
     parser.add_argument("--base-model", action="append", help="Repeat BACKEND=LOCAL_QLORA_BASE_DIRECTORY")
     parser.add_argument("--ensemble-weights", nargs=3, type=float, metavar=("GEMMA", "LLAMA", "DEBERTA"))
     parser.add_argument("--sentence-model")
     parser.add_argument("--sentence-revision")
     parser.add_argument("--experiment-name")
     parser.add_argument("--run-name")
+    parser.add_argument("--offline-wheelhouse", help="Saved dependency wheels directory")
+    parser.add_argument("--discover-root", action="append", help="Additional root containing saved training outputs")
     parser.add_argument("--cross-validation", dest="cross_validation", action="store_true",
                         help="Train every grouped fold (default)")
     parser.add_argument("--single-fold", dest="cross_validation", action="store_false",
@@ -174,7 +200,10 @@ def parse_args(argv=None):
     parser.add_argument("--allow-cpu-training", action="store_true", help="Only for tiny CPU smoke tests")
     for flag, destination in (("--disable-mlflow", "enable_mlflow"), ("--no-log-models", "log_models_to_mlflow"),
                               ("--no-semantic-features", "use_semantic_features"), ("--no-tta", "tta"),
-                              ("--no-amp", "use_amp"), ("--no-gradient-checkpointing", "gradient_checkpointing")):
+                              ("--no-amp", "use_amp"), ("--no-gradient-checkpointing", "gradient_checkpointing"),
+                              ("--no-export-quantized-bases", "export_quantized_bases"),
+                              ("--no-export-offline-dependencies", "export_offline_dependencies"),
+                              ("--no-install-offline-dependencies", "install_offline_dependencies")):
         parser.add_argument(flag, dest=destination, action="store_false")
     values = vars(parser.parse_args(argv))
     path = values.pop("config", None)
@@ -186,6 +215,7 @@ def parse_args(argv=None):
         if unknown:
             raise ValueError(f"Unknown config fields: {sorted(unknown)}")
         input_root = values.pop("input_root", None)
+        discover_roots = values.pop("discover_root", None)
         named = {flag: values.pop(flag, None) for flag in ("model_source", "model_revision", "bundle", "base_model")}
         weights = values.pop("ensemble_weights", None)
         settings.update(values)
@@ -194,15 +224,21 @@ def parse_args(argv=None):
                 if key not in values:
                     settings[key] = str(input_root / "llm-classification-finetuning" / filename)
         cfg = Config(**settings)
+        if input_root is not None:
+            cfg.auto_discover_roots = (str(input_root), *cfg.auto_discover_roots)
+        if discover_roots is not None:
+            cfg.auto_discover_roots = (*discover_roots, *cfg.auto_discover_roots)
         for flag, destination in (("model_source", "model_sources"), ("model_revision", "model_revisions"),
                                   ("bundle", "inference_bundles"), ("base_model", "base_model_overrides")):
             if named[flag] is not None:
-                setattr(cfg, destination, {**getattr(cfg, destination), **_named_values(named[flag], "--" + flag.replace("_", "-"))})
+                setattr(cfg, destination, {**getattr(cfg, destination), **_named_values(
+                    named[flag], "--" + flag.replace("_", "-"), multiple=flag == "bundle")})
         if weights is not None:
             cfg.ensemble_weights = dict(zip(("gemma", "llama", "deberta"), weights))
         cfg.train_backends = tuple(cfg.train_backends)
         cfg.lora_target_modules = tuple(cfg.lora_target_modules)
+        cfg.auto_discover_roots = tuple(cfg.auto_discover_roots)
         cfg.validate()
-    except (TypeError, ValueError, OSError) as error:
+    except (TypeError, ValueError, OSError, RuntimeError) as error:
         parser.error(str(error))
     return cfg
